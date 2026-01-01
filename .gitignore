@@ -1,0 +1,24 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Models (re-downloaded from HuggingFace)
+models/
+*.pt
+*.bin
+*.safetensors
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Outputs (regenerated)
+*.png

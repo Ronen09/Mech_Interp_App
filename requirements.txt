@@ -1,0 +1,5 @@
+torch
+transformer-lens
+fastapi
+uvicorn
+matplotlib
