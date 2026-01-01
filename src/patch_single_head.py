@@ -6,9 +6,9 @@ torch.set_grad_enabled(False)
 MODEL_NAME = "gpt2-small"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-CLEAN_PROMPT = "Paris is the capital of"
-CORRUPT_PROMPT = "Berlin is the capital of"
-TARGET_TOKEN_STR = " France"
+CLEAN_PROMPT = "Delhi is the capital of"
+CORRUPT_PROMPT = "Tokyo is the capital of"
+TARGET_TOKEN_STR = " India"
 
 # Head to patch
 LAYER = 8
@@ -45,7 +45,9 @@ def main():
         value[:, -1, HEAD, :] = clean_head
         return value
 
-    patched_logits = model.run_with_hooks(corrupt_toks, fwd_hooks=[(hook_name, hook_fn)])
+    patched_logits = model.run_with_hooks(
+        corrupt_toks, fwd_hooks=[(hook_name, hook_fn)]
+    )
     patched_prob = patched_logits[0, -1].softmax(-1)[target_id].item()
 
     # Calculate recovery

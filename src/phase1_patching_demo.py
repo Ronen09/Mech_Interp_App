@@ -1,8 +1,8 @@
-import torch
 import numpy as np
+import torch
+from tqdm import tqdm
 from transformer_lens import HookedTransformer
 from transformer_lens.hook_points import HookPoint
-from tqdm import tqdm
 
 torch.set_grad_enabled(False)
 
@@ -10,9 +10,9 @@ MODEL_NAME = "gpt2-small"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Choose a simple "fact" task where corruption plausibly flips the answer
-CLEAN_PROMPT = "Paris is the capital of"
-CORRUPT_PROMPT = "Berlin is the capital of"
-TARGET_TOKEN_STR = " France"  # leading space matters for GPT-2 BPE
+CLEAN_PROMPT = "Delhi is the capital of"
+CORRUPT_PROMPT = "Tokyo is the capital of"
+TARGET_TOKEN_STR = " India"
 
 
 def head_out_hook_factory(cache, layer: int, head: int):
@@ -36,8 +36,7 @@ def patch_head_and_get_prob(model, corrupt_toks, clean_cache, target_id, layer, 
     """Patch a single head and return probability of target token."""
     hook_name, hook_fn = head_out_hook_factory(clean_cache, layer, head)
     patched_logits = model.run_with_hooks(
-        corrupt_toks,
-        fwd_hooks=[(hook_name, hook_fn)]
+        corrupt_toks, fwd_hooks=[(hook_name, hook_fn)]
     )
     patched_probs = patched_logits[0, -1].softmax(dim=-1)
     return patched_probs[target_id].item()
@@ -103,7 +102,9 @@ def print_results_table(results, corrupt_prob, clean_prob):
         head = idx % n_heads
         prob = results[layer, head]
         rec = recovery[layer, head]
-        print(f"{i+1:2d}. L{layer:02d}H{head:02d}: P={prob:.4f}, recovery={rec*100:.1f}%")
+        print(
+            f"{i + 1:2d}. L{layer:02d}H{head:02d}: P={prob:.4f}, recovery={rec * 100:.1f}%"
+        )
 
 
 def save_heatmap(results, corrupt_prob, clean_prob, filename="patching_heatmap.png"):
@@ -116,18 +117,22 @@ def save_heatmap(results, corrupt_prob, clean_prob, filename="patching_heatmap.p
         fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
         # Raw probabilities
-        im1 = axes[0].imshow(results, cmap='viridis', aspect='auto')
-        axes[0].set_xlabel('Head')
-        axes[0].set_ylabel('Layer')
-        axes[0].set_title(f"P(' France') after patching\n(corrupt={corrupt_prob:.4f}, clean={clean_prob:.4f})")
-        plt.colorbar(im1, ax=axes[0], label='Probability')
+        im1 = axes[0].imshow(results, cmap="viridis", aspect="auto")
+        axes[0].set_xlabel("Head")
+        axes[0].set_ylabel("Layer")
+        axes[0].set_title(
+            f"P(' France') after patching\n(corrupt={corrupt_prob:.4f}, clean={clean_prob:.4f})"
+        )
+        plt.colorbar(im1, ax=axes[0], label="Probability")
 
         # Recovery ratio
-        im2 = axes[1].imshow(recovery * 100, cmap='RdYlGn', aspect='auto', vmin=-5, vmax=20)
-        axes[1].set_xlabel('Head')
-        axes[1].set_ylabel('Layer')
-        axes[1].set_title('Recovery % (how much of clean-corrupt gap is recovered)')
-        plt.colorbar(im2, ax=axes[1], label='Recovery %')
+        im2 = axes[1].imshow(
+            recovery * 100, cmap="RdYlGn", aspect="auto", vmin=-5, vmax=20
+        )
+        axes[1].set_xlabel("Head")
+        axes[1].set_ylabel("Layer")
+        axes[1].set_title("Recovery % (how much of clean-corrupt gap is recovered)")
+        plt.colorbar(im2, ax=axes[1], label="Recovery %")
 
         plt.tight_layout()
         plt.savefig(filename, dpi=150)
@@ -169,7 +174,9 @@ def main():
     print()
 
     # Sweep all heads
-    results = sweep_all_heads(model, clean_cache, corrupt_toks, target_id, n_layers, n_heads)
+    results = sweep_all_heads(
+        model, clean_cache, corrupt_toks, target_id, n_layers, n_heads
+    )
 
     # Print results
     print_results_table(results, corrupt_prob, clean_prob)
