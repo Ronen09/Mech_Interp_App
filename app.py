@@ -45,6 +45,7 @@ class PatchResponse(BaseModel):
     clean_rank: int
     corrupt_rank: int
     patched_rank: int
+    top_clean: list[TokenProb]
     top_corrupt: list[TokenProb]
     top_patched: list[TokenProb]
 
@@ -153,6 +154,40 @@ def index():
             border-radius: 10px;
             transition: width 0.5s ease;
         }
+        .tokens-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 20px;
+            margin-top: 20px;
+        }
+        .token-list {
+            background: #0f1624;
+            padding: 15px;
+            border-radius: 8px;
+        }
+        .token-list h3 {
+            margin: 0 0 10px 0;
+            color: #00d4ff;
+            font-size: 16px;
+        }
+        .token-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #1a2332;
+            font-family: monospace;
+            font-size: 13px;
+        }
+        .token-item:last-child {
+            border-bottom: none;
+        }
+        .token-name {
+            color: #eee;
+            white-space: pre;
+        }
+        .token-prob {
+            color: #888;
+        }
     </style>
 </head>
 <body>
@@ -210,6 +245,21 @@ def index():
                 <div class="recovery-fill" id="recovery_bar" style="width: 0%"></div>
             </div>
         </div>
+
+        <div class="tokens-grid">
+            <div class="token-list">
+                <h3>Top-10 Tokens (Clean)</h3>
+                <div id="top_clean"></div>
+            </div>
+            <div class="token-list">
+                <h3>Top-10 Tokens (Corrupt)</h3>
+                <div id="top_corrupt"></div>
+            </div>
+            <div class="token-list">
+                <h3>Top-10 Tokens (Patched)</h3>
+                <div id="top_patched"></div>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -241,6 +291,20 @@ def index():
                 document.getElementById('ranks').textContent = `#${result.clean_rank} → #${result.corrupt_rank} → #${result.patched_rank}`;
                 document.getElementById('recovery_pct').textContent = result.recovery_pct.toFixed(1) + '%';
                 document.getElementById('recovery_bar').style.width = Math.min(100, Math.max(0, result.recovery_pct)) + '%';
+
+                // Display top tokens
+                function renderTokens(tokens, elementId) {
+                    const html = tokens.map((t, i) =>
+                        `<div class="token-item">
+                            <span class="token-name">${i+1}. "${t.token}"</span>
+                            <span class="token-prob">${t.prob.toFixed(4)}</span>
+                        </div>`
+                    ).join('');
+                    document.getElementById(elementId).innerHTML = html;
+                }
+                renderTokens(result.top_clean, 'top_clean');
+                renderTokens(result.top_corrupt, 'top_corrupt');
+                renderTokens(result.top_patched, 'top_patched');
             } catch (e) {
                 alert('Error: ' + e.message);
             }
@@ -306,6 +370,7 @@ def patch(request: PatchRequest):
         tokens = [model.to_string(i.item()) for i in idx]
         return [TokenProb(token=t, prob=p.item()) for t, p in zip(tokens, vals)]
 
+    top_clean = get_top_k(clean_probs)
     top_corrupt = get_top_k(corrupt_probs)
     top_patched = get_top_k(patched_probs)
 
@@ -322,6 +387,7 @@ def patch(request: PatchRequest):
         clean_rank=clean_rank,
         corrupt_rank=corrupt_rank,
         patched_rank=patched_rank,
+        top_clean=top_clean,
         top_corrupt=top_corrupt,
         top_patched=top_patched,
     )
