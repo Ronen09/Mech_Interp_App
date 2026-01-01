@@ -27,6 +27,11 @@ class PatchRequest(BaseModel):
     head: int = 11
 
 
+class TokenProb(BaseModel):
+    token: str
+    prob: float
+
+
 class PatchResponse(BaseModel):
     clean_prompt: str
     corrupt_prompt: str
@@ -37,6 +42,11 @@ class PatchResponse(BaseModel):
     corrupt_prob: float
     patched_prob: float
     recovery_pct: float
+    clean_rank: int
+    corrupt_rank: int
+    patched_rank: int
+    top_corrupt: list[TokenProb]
+    top_patched: list[TokenProb]
 
 
 @app.get("/health")
@@ -190,6 +200,10 @@ def index():
             <span class="metric-label">Patched P(target)</span>
             <span class="metric-value" id="patched_prob">-</span>
         </div>
+        <div class="metric">
+            <span class="metric-label">Target Rank (Clean → Corrupt → Patched)</span>
+            <span class="metric-value" id="ranks">-</span>
+        </div>
         <div class="recovery">
             <div>Recovery: <span id="recovery_pct">-</span></div>
             <div class="recovery-bar">
@@ -224,6 +238,7 @@ def index():
                 document.getElementById('clean_prob').textContent = result.clean_prob.toFixed(4);
                 document.getElementById('corrupt_prob').textContent = result.corrupt_prob.toFixed(4);
                 document.getElementById('patched_prob').textContent = result.patched_prob.toFixed(4);
+                document.getElementById('ranks').textContent = `#${result.clean_rank} → #${result.corrupt_rank} → #${result.patched_rank}`;
                 document.getElementById('recovery_pct').textContent = result.recovery_pct.toFixed(1) + '%';
                 document.getElementById('recovery_bar').style.width = Math.min(100, Math.max(0, result.recovery_pct)) + '%';
             } catch (e) {
@@ -251,8 +266,13 @@ def patch(request: PatchRequest):
     _, clean_cache = model.run_with_cache(clean_toks)
 
     # Get baseline probabilities
-    clean_prob = model(clean_toks)[0, -1].softmax(-1)[target_id].item()
-    corrupt_prob = model(corrupt_toks)[0, -1].softmax(-1)[target_id].item()
+    clean_logits = model(clean_toks)
+    clean_probs = clean_logits[0, -1].softmax(-1)
+    clean_prob = clean_probs[target_id].item()
+
+    corrupt_logits = model(corrupt_toks)
+    corrupt_probs = corrupt_logits[0, -1].softmax(-1)
+    corrupt_prob = corrupt_probs[target_id].item()
 
     # Patch the head
     hook_name = f"blocks.{request.layer}.attn.hook_z"
@@ -266,13 +286,28 @@ def patch(request: PatchRequest):
     patched_logits = model.run_with_hooks(
         corrupt_toks, fwd_hooks=[(hook_name, hook_fn)]
     )
-    patched_prob = patched_logits[0, -1].softmax(-1)[target_id].item()
+    patched_probs = patched_logits[0, -1].softmax(-1)
+    patched_prob = patched_probs[target_id].item()
 
     # Calculate recovery
     if clean_prob - corrupt_prob > 1e-10:
         recovery_pct = (patched_prob - corrupt_prob) / (clean_prob - corrupt_prob) * 100
     else:
         recovery_pct = 0.0
+
+    # Calculate ranks (1-indexed)
+    clean_rank = (clean_probs > clean_probs[target_id]).sum().item() + 1
+    corrupt_rank = (corrupt_probs > corrupt_probs[target_id]).sum().item() + 1
+    patched_rank = (patched_probs > patched_probs[target_id]).sum().item() + 1
+
+    # Get top-10 tokens
+    def get_top_k(probs, k=10):
+        vals, idx = probs.topk(k)
+        tokens = [model.to_string(i.item()) for i in idx]
+        return [TokenProb(token=t, prob=p.item()) for t, p in zip(tokens, vals)]
+
+    top_corrupt = get_top_k(corrupt_probs)
+    top_patched = get_top_k(patched_probs)
 
     return PatchResponse(
         clean_prompt=request.clean_prompt,
@@ -284,6 +319,11 @@ def patch(request: PatchRequest):
         corrupt_prob=corrupt_prob,
         patched_prob=patched_prob,
         recovery_pct=recovery_pct,
+        clean_rank=clean_rank,
+        corrupt_rank=corrupt_rank,
+        patched_rank=patched_rank,
+        top_corrupt=top_corrupt,
+        top_patched=top_patched,
     )
 
 
