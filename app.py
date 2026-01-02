@@ -25,6 +25,8 @@ class PatchRequest(BaseModel):
     target_token: str = " France"
     layer: int = 8
     head: int = 11
+    mode: str = "patch"  # "patch" or "ablate"
+    clamp_token: str | None = None  # For ablation: token to clamp to baseline
 
 
 class TokenProb(BaseModel):
@@ -48,6 +50,9 @@ class PatchResponse(BaseModel):
     top_clean: list[TokenProb]
     top_corrupt: list[TokenProb]
     top_patched: list[TokenProb]
+    delta_prob: float = 0.0
+    delta_rank: int = 0
+    delta_entropy: float = 0.0
 
 
 @app.get("/health")
@@ -188,11 +193,22 @@ def index():
         .token-prob {
             color: #888;
         }
+        .token-item.clickable {
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .token-item.clickable:hover {
+            background: #1a2332;
+        }
+        .token-item.selected {
+            background: #2a4a5a;
+            border-left: 3px solid #00d4ff;
+        }
     </style>
 </head>
 <body>
-    <h1>GPT-2 Activation Patching</h1>
-    <p>Patch a single attention head from clean to corrupt prompt and measure recovery.</p>
+    <h1>GPT-2 Activation Patching & Ablation</h1>
+    <p>Patch or ablate a single attention head and measure the impact on predictions.</p>
 
     <div class="form-group">
         <label>Clean Prompt</label>
@@ -220,7 +236,15 @@ def index():
         </div>
     </div>
 
-    <button onclick="runPatch()" id="patchBtn">Run Patching</button>
+    <div class="form-group">
+        <label>Mode</label>
+        <select id="mode" onchange="handleModeChange()">
+            <option value="patch">Patch (replace with clean)</option>
+            <option value="ablate">Ablate (zero out)</option>
+        </select>
+    </div>
+
+    <button onclick="runPatch()" id="patchBtn">Run</button>
 
     <div id="results">
         <div class="metric">
@@ -232,15 +256,15 @@ def index():
             <span class="metric-value" id="corrupt_prob">-</span>
         </div>
         <div class="metric">
-            <span class="metric-label">Patched P(target)</span>
+            <span class="metric-label" id="modified_label">Patched P(target)</span>
             <span class="metric-value" id="patched_prob">-</span>
         </div>
         <div class="metric">
-            <span class="metric-label">Target Rank (Clean → Corrupt → Patched)</span>
+            <span class="metric-label" id="rank_label">Target Rank (Clean → Corrupt → Patched)</span>
             <span class="metric-value" id="ranks">-</span>
         </div>
         <div class="recovery">
-            <div>Recovery: <span id="recovery_pct">-</span></div>
+            <div><span id="recovery_label">Recovery</span>: <span id="recovery_pct">-</span></div>
             <div class="recovery-bar">
                 <div class="recovery-fill" id="recovery_bar" style="width: 0%"></div>
             </div>
@@ -248,7 +272,7 @@ def index():
 
         <div class="tokens-grid">
             <div class="token-list">
-                <h3>Top-10 Tokens (Clean)</h3>
+                <h3 id="clean_tokens_label">Top-10 Tokens (Clean)</h3>
                 <div id="top_clean"></div>
             </div>
             <div class="token-list">
@@ -256,25 +280,59 @@ def index():
                 <div id="top_corrupt"></div>
             </div>
             <div class="token-list">
-                <h3>Top-10 Tokens (Patched)</h3>
+                <h3 id="modified_tokens_label">Top-10 Tokens (Patched)</h3>
                 <div id="top_patched"></div>
             </div>
         </div>
     </div>
 
     <script>
+        let selectedClampToken = null;
+        let lastRequestData = null;
+
+        function handleModeChange() {
+            // Clear selection when switching modes
+            selectedClampToken = null;
+            document.querySelectorAll('#top_clean .token-item').forEach(el => {
+                el.classList.remove('selected');
+            });
+        }
+
+        async function selectTokenForClamping(token) {
+            // Toggle selection - if clicking the same token, unselect it
+            if (selectedClampToken === token) {
+                selectedClampToken = null;
+            } else {
+                selectedClampToken = token;
+            }
+
+            // Update visual selection (will be reflected in next render)
+            // Note: Visual update happens automatically when runPatch re-renders
+
+            // Automatically re-run with the selected token if we're in ablate mode
+            if (lastRequestData && lastRequestData.mode === 'ablate') {
+                await runPatch();
+            }
+        }
+
         async function runPatch() {
             const btn = document.getElementById('patchBtn');
             btn.disabled = true;
             btn.textContent = 'Running...';
 
+            const mode = document.getElementById('mode').value;
             const data = {
                 clean_prompt: document.getElementById('clean_prompt').value,
                 corrupt_prompt: document.getElementById('corrupt_prompt').value,
                 target_token: document.getElementById('target_token').value,
                 layer: parseInt(document.getElementById('layer').value),
-                head: parseInt(document.getElementById('head').value)
+                head: parseInt(document.getElementById('head').value),
+                mode: mode,
+                clamp_token: mode === 'ablate' ? selectedClampToken : null
             };
+
+            // Store for reactive updates
+            lastRequestData = data;
 
             try {
                 const resp = await fetch('/patch', {
@@ -283,26 +341,76 @@ def index():
                     body: JSON.stringify(data)
                 });
                 const result = await resp.json();
+                const mode = data.mode;
+                const modeText = mode === 'patch' ? 'Patched' : 'Ablated';
 
                 document.getElementById('results').style.display = 'block';
-                document.getElementById('clean_prob').textContent = result.clean_prob.toFixed(4);
-                document.getElementById('corrupt_prob').textContent = result.corrupt_prob.toFixed(4);
-                document.getElementById('patched_prob').textContent = result.patched_prob.toFixed(4);
-                document.getElementById('ranks').textContent = `#${result.clean_rank} → #${result.corrupt_rank} → #${result.patched_rank}`;
-                document.getElementById('recovery_pct').textContent = result.recovery_pct.toFixed(1) + '%';
-                document.getElementById('recovery_bar').style.width = Math.min(100, Math.max(0, result.recovery_pct)) + '%';
+
+                if (mode === 'patch') {
+                    // Show all metrics for patch mode
+                    document.getElementById('modified_label').textContent = 'Patched P(target)';
+                    document.getElementById('rank_label').textContent = 'Target Rank (Clean → Corrupt → Patched)';
+                    document.getElementById('modified_tokens_label').textContent = 'Top-10 Tokens (Patched)';
+                    document.getElementById('clean_tokens_label').textContent = 'Top-10 Tokens (Clean)';
+
+                    document.querySelectorAll('.metric').forEach(el => el.style.display = 'flex');
+                    document.querySelector('.recovery').style.display = 'block';
+
+                    document.getElementById('clean_prob').textContent = result.clean_prob.toFixed(4);
+                    document.getElementById('corrupt_prob').textContent = result.corrupt_prob.toFixed(4);
+                    document.getElementById('patched_prob').textContent = result.patched_prob.toFixed(4);
+                    document.getElementById('ranks').textContent = `#${result.clean_rank} → #${result.corrupt_rank} → #${result.patched_rank}`;
+                    document.getElementById('recovery_label').textContent = 'Recovery';
+                    document.getElementById('recovery_pct').textContent = result.recovery_pct.toFixed(1) + '%';
+                    document.getElementById('recovery_bar').style.width = Math.min(100, Math.max(0, result.recovery_pct)) + '%';
+
+                    // Show all 3 token columns
+                    document.querySelectorAll('.token-list').forEach(el => el.style.display = 'block');
+                    document.querySelector('.tokens-grid').style.gridTemplateColumns = '1fr 1fr 1fr';
+                } else {
+                    // Show specific metrics for ablation mode
+                    const clampSuffix = data.clamp_token ? ` (+ "${data.clamp_token}" clamped)` : '';
+                    document.getElementById('modified_label').textContent = 'Clean + ablation P(target)' + clampSuffix;
+                    document.getElementById('rank_label').textContent = 'Clean degradation';
+                    document.getElementById('modified_tokens_label').textContent = 'Top-10 Tokens (Ablated' + clampSuffix + ')';
+                    document.getElementById('clean_tokens_label').textContent = 'Top-10 Tokens (Clean) - Click to clamp (auto-updates)';
+
+                    // Show only first 3 metrics and hide recovery
+                    const metrics = document.querySelectorAll('.metric');
+                    metrics[0].style.display = 'flex';  // Clean P(target)
+                    metrics[1].style.display = 'none';  // Corrupt P(target) - hide
+                    metrics[2].style.display = 'flex';  // Ablated P(target)
+                    metrics[3].style.display = 'flex';  // Degradation
+                    document.querySelector('.recovery').style.display = 'none';
+
+                    document.getElementById('clean_prob').textContent = result.clean_prob.toFixed(4);
+                    document.getElementById('patched_prob').textContent = result.patched_prob.toFixed(4);
+                    document.getElementById('ranks').textContent = `Δprob=${result.delta_prob.toFixed(4)}, Δrank=${result.delta_rank > 0 ? '+' : ''}${result.delta_rank}, Δentropy=${result.delta_entropy.toFixed(3)}`;
+
+                    // Show only 2 token columns (clean and ablated)
+                    document.querySelectorAll('.token-list')[0].style.display = 'block'; // Clean
+                    document.querySelectorAll('.token-list')[1].style.display = 'none';  // Corrupt (hide)
+                    document.querySelectorAll('.token-list')[2].style.display = 'block'; // Ablated
+                    document.querySelector('.tokens-grid').style.gridTemplateColumns = '1fr 1fr';
+                }
 
                 // Display top tokens
-                function renderTokens(tokens, elementId) {
-                    const html = tokens.map((t, i) =>
-                        `<div class="token-item">
+                function renderTokens(tokens, elementId, clickable = false) {
+                    const html = tokens.map((t, i) => {
+                        const clickClass = clickable ? 'clickable' : '';
+                        const selectedClass = (clickable && selectedClampToken === t.token) ? 'selected' : '';
+                        const clickAttr = clickable ? `onclick="selectTokenForClamping('${t.token.replace(/'/g, "\\'")}')"` : '';
+                        return `<div class="token-item ${clickClass} ${selectedClass}" ${clickAttr}>
                             <span class="token-name">${i+1}. "${t.token}"</span>
                             <span class="token-prob">${t.prob.toFixed(4)}</span>
-                        </div>`
-                    ).join('');
+                        </div>`;
+                    }).join('');
                     document.getElementById(elementId).innerHTML = html;
                 }
-                renderTokens(result.top_clean, 'top_clean');
+
+                // Make clean tokens clickable only in ablation mode
+                const isAblateMode = mode === 'ablate';
+                renderTokens(result.top_clean, 'top_clean', isAblateMode);
                 renderTokens(result.top_corrupt, 'top_corrupt');
                 renderTokens(result.top_patched, 'top_patched');
             } catch (e) {
@@ -310,7 +418,7 @@ def index():
             }
 
             btn.disabled = false;
-            btn.textContent = 'Run Patching';
+            btn.textContent = 'Run';
         }
     </script>
 </body>
@@ -338,31 +446,72 @@ def patch(request: PatchRequest):
     corrupt_probs = corrupt_logits[0, -1].softmax(-1)
     corrupt_prob = corrupt_probs[target_id].item()
 
-    # Patch the head
+    # Patch or ablate the head
     hook_name = f"blocks.{request.layer}.attn.hook_z"
-    clean_head = clean_cache[hook_name][:, -1, request.head, :].clone()
 
-    def hook_fn(value, hook):
-        value = value.clone()
-        value[:, -1, request.head, :] = clean_head
-        return value
+    if request.mode == "patch":
+        clean_head = clean_cache[hook_name][:, -1, request.head, :].clone()
+        def hook_fn(value, hook):
+            value = value.clone()
+            value[:, -1, request.head, :] = clean_head
+            return value
 
-    patched_logits = model.run_with_hooks(
-        corrupt_toks, fwd_hooks=[(hook_name, hook_fn)]
-    )
-    patched_probs = patched_logits[0, -1].softmax(-1)
-    patched_prob = patched_probs[target_id].item()
+        patched_logits = model.run_with_hooks(
+            corrupt_toks, fwd_hooks=[(hook_name, hook_fn)]
+        )
+        patched_probs = patched_logits[0, -1].softmax(-1)
+        patched_prob = patched_probs[target_id].item()
 
-    # Calculate recovery
-    if clean_prob - corrupt_prob > 1e-10:
-        recovery_pct = (patched_prob - corrupt_prob) / (clean_prob - corrupt_prob) * 100
-    else:
-        recovery_pct = 0.0
+        # Calculate recovery
+        if clean_prob - corrupt_prob > 1e-10:
+            recovery_pct = (patched_prob - corrupt_prob) / (clean_prob - corrupt_prob) * 100
+        else:
+            recovery_pct = 0.0
+    else:  # ablate
+        def hook_fn(value, hook):
+            value = value.clone()
+            value[:, -1, request.head, :] = 0.0
+            return value
+
+        # Run ablation on clean prompt
+        ablated_logits = model.run_with_hooks(
+            clean_toks, fwd_hooks=[(hook_name, hook_fn)]
+        )
+
+        # Optional: Clamp selected token logit to baseline
+        if request.clamp_token:
+            try:
+                clamp_id = model.to_single_token(request.clamp_token)
+                baseline_clamp_logit = clean_logits[0, -1, clamp_id].item()
+                ablated_logits[0, -1, clamp_id] = baseline_clamp_logit
+            except:
+                pass  # If token is invalid, just skip clamping
+
+        patched_probs = ablated_logits[0, -1].softmax(-1)
+        patched_prob = patched_probs[target_id].item()
+
+        # Store delta metrics (we'll send these in the response for ablation mode)
+        recovery_pct = 0.0  # Not used for ablation
 
     # Calculate ranks (1-indexed)
     clean_rank = (clean_probs > clean_probs[target_id]).sum().item() + 1
     corrupt_rank = (corrupt_probs > corrupt_probs[target_id]).sum().item() + 1
     patched_rank = (patched_probs > patched_probs[target_id]).sum().item() + 1
+
+    # Calculate deltas for ablation mode
+    if request.mode == "ablate":
+        # Δprob = p_clean - p_ablated
+        delta_prob = clean_prob - patched_prob
+        # Δrank = rank_ablated - rank_clean (positive means worse)
+        delta_rank = patched_rank - clean_rank
+        # Δentropy = H(p_ablated) - H(p_clean)
+        clean_entropy = -(clean_probs * torch.log(clean_probs + 1e-12)).sum().item()
+        ablated_entropy = -(patched_probs * torch.log(patched_probs + 1e-12)).sum().item()
+        delta_entropy = ablated_entropy - clean_entropy
+    else:
+        delta_prob = 0.0
+        delta_rank = 0
+        delta_entropy = 0.0
 
     # Get top-10 tokens
     def get_top_k(probs, k=10):
@@ -390,6 +539,9 @@ def patch(request: PatchRequest):
         top_clean=top_clean,
         top_corrupt=top_corrupt,
         top_patched=top_patched,
+        delta_prob=delta_prob,
+        delta_rank=delta_rank,
+        delta_entropy=delta_entropy,
     )
 
 
