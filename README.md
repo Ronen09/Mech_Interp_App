@@ -1,14 +1,17 @@
-# GPT-2 Activation Patching
+# GPT-2 Circuit Analysis
 
-Interactive web application for exploring activation patching in GPT-2 small, investigating how individual attention heads contribute to factual recall.
+Interactive web application for exploring activation patching and ablation in GPT-2 small, investigating how individual and groups of attention heads contribute to factual recall.
 
 ## Features
 
 - **Activation Patching**: Patch individual attention heads from a clean run into a corrupted run
+- **Single Head Ablation**: Zero out individual heads and measure impact on predictions
+- **Multi-Head Circuit Analysis**: Select and ablate multiple heads simultaneously to discover circuits
+- **Full Head Sweep**: Ablate all 144 heads and visualize importance in a heatmap
 - **Recovery Metrics**: Measure how much patching recovers the target token probability
 - **Rank Tracking**: Monitor how the target token rank changes (Clean → Corrupt → Patched)
-- **Top-10 Tokens**: View side-by-side comparison of predicted tokens across clean, corrupt, and patched runs
-- **Interactive Web UI**: Browser-based interface for experimenting with different prompts and heads
+- **Top-10 Tokens**: View side-by-side comparison of predicted tokens across runs
+- **Interactive Web UI**: Tabbed interface with Single Head, Full Sweep, and Circuit Analysis modes
 - **REST API**: FastAPI backend for programmatic access
 
 ## Quick Start
@@ -43,13 +46,27 @@ docker compose -f docker-compose.gpu.yml up --build
 
 ### Web Interface
 
-1. Open http://localhost:8000
-2. Enter your prompts:
-   - **Clean prompt**: "Paris is the capital of"
-   - **Corrupt prompt**: "Berlin is the capital of"
-   - **Target token**: " France" (include leading space)
-3. Select layer and head to patch (0-11)
-4. Click "Run Patching"
+The UI has three tabs:
+
+#### Single Head Tab
+1. Enter your prompts (clean, corrupt) and target token
+2. Select mode: **Patch** (replace with clean) or **Ablate** (zero out)
+3. Select layer and head (0-11)
+4. Click "Run Analysis"
+
+#### Full Sweep Tab
+1. Enter clean prompt and target token
+2. Click "Run Full Sweep (144 heads)"
+3. View the heatmap showing head importance
+4. Click any cell to see detailed metrics
+5. Use the metric dropdown to switch between Δprob, Δmargin, Δrank, Δentropy
+
+#### Circuit Analysis Tab
+1. Enter clean prompt and target token
+2. Click heads in the grid to select them (green checkmark = selected)
+3. Click "Analyze Circuit" to ablate all selected heads simultaneously
+4. View combined impact metrics and token predictions
+5. Use "Clear Selection" to reset
 
 ### API Endpoint
 
@@ -76,21 +93,42 @@ Response:
   "clean_rank": 1,
   "corrupt_rank": 523,
   "patched_rank": 42,
-  "top_clean": [
-    {"token": " France", "prob": 0.3342},
-    {"token": " Paris", "prob": 0.1234},
-    ...
-  ],
-  "top_corrupt": [
-    {"token": " Germany", "prob": 0.5213},
-    {"token": " the", "prob": 0.2190},
-    ...
-  ],
-  "top_patched": [
-    {"token": " Germany", "prob": 0.5224},
-    {"token": " the", "prob": 0.2168},
-    ...
+  "top_clean": [{"token": " France", "prob": 0.3342}, ...],
+  "top_corrupt": [{"token": " Germany", "prob": 0.5213}, ...],
+  "top_patched": [{"token": " Germany", "prob": 0.5224}, ...]
+}
+```
+
+**POST** `/multi-ablate`
+
+Ablate multiple heads simultaneously for circuit analysis.
+
+Request:
+```json
+{
+  "clean_prompt": "Paris is the capital of",
+  "target_token": " France",
+  "heads": [
+    {"layer": 8, "head": 11},
+    {"layer": 9, "head": 6},
+    {"layer": 10, "head": 0}
   ]
+}
+```
+
+Response:
+```json
+{
+  "clean_prob": 0.3342,
+  "ablated_prob": 0.0891,
+  "clean_rank": 1,
+  "ablated_rank": 5,
+  "delta_prob": 0.2451,
+  "delta_rank": 4,
+  "delta_entropy": 0.234,
+  "delta_margin": 1.523,
+  "top_clean": [{"token": " France", "prob": 0.3342}, ...],
+  "top_ablated": [{"token": " the", "prob": 0.1523}, ...]
 }
 ```
 
@@ -124,14 +162,27 @@ python src/load_gpt2.py
 
 ## How It Works
 
-**Activation Patching** is a technique to identify which components of a neural network are responsible for specific behaviors:
+### Activation Patching
+A technique to identify which components are responsible for specific behaviors:
 
-1. **Clean Run**: Run the model on the clean prompt ("Paris is the capital of") and cache all activations
-2. **Corrupt Run**: Run on the corrupted prompt ("Berlin is the capital of")
+1. **Clean Run**: Run the model on the clean prompt and cache all activations
+2. **Corrupt Run**: Run on the corrupted prompt
 3. **Patching**: Replace a single attention head's output in the corrupt run with the cached clean activation
-4. **Measure Recovery**: See if the patched model now predicts the clean answer (" France")
+4. **Measure Recovery**: See if the patched model now predicts the clean answer
 
 If patching head `L8H11` significantly increases P(" France"), that head is important for the "Paris → France" fact.
+
+### Ablation
+Zero out a head's output to measure its importance:
+- **Single Head**: Ablate one head and measure Δprob, Δrank, Δentropy
+- **Full Sweep**: Ablate all 144 heads individually to create importance heatmaps
+
+### Circuit Analysis
+Ablate multiple heads simultaneously to discover circuits:
+- Select heads that you hypothesize form a circuit
+- Ablate them all at once and measure combined impact
+- If combined ablation has a larger effect than sum of individual ablations → heads work together
+- If combined effect is similar to individual effects → heads may be redundant
 
 ## Project Structure
 
