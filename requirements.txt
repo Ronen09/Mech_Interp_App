@@ -3,3 +3,4 @@ transformer-lens
 fastapi
 uvicorn
 matplotlib
+sae-lens

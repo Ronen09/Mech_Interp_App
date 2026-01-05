@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from transformer_lens import HookedTransformer
+from sae_lens import SAE
 
 torch.set_grad_enabled(False)
 
@@ -17,6 +18,17 @@ print(f"Model loaded on {device}")
 
 N_LAYERS = model.cfg.n_layers
 N_HEADS = model.cfg.n_heads
+
+# Load SAE for residual stream (layer 8)
+print("Loading SAE for layer 8 residual stream...")
+SAE_HOOK_POINT = "blocks.8.hook_resid_pre"
+sae = SAE.from_pretrained(
+    release="gpt2-small-res-jb",
+    sae_id=SAE_HOOK_POINT,
+    device=device,
+)[0]  # from_pretrained returns (sae, cfg, sparsity)
+SAE_N_FEATURES = sae.cfg.d_sae
+print(f"SAE loaded: {SAE_N_FEATURES} features at {SAE_HOOK_POINT}")
 
 
 class PatchRequest(BaseModel):
@@ -96,6 +108,96 @@ class MultiAblateResponse(BaseModel):
     delta_margin: float
     top_clean: list[TokenProb]
     top_ablated: list[TokenProb]
+
+
+class PatchSweepRequest(BaseModel):
+    clean_prompt: str = "John gave Mary the book. Mary gave it to"
+    corrupt_prompt: str = "Bob gave Mary the book. Bob gave it to"
+    target_token: str = " John"
+
+
+class PatchSweepResponse(BaseModel):
+    clean_prompt: str
+    corrupt_prompt: str
+    target_token: str
+    clean_prob: float
+    corrupt_prob: float
+    clean_rank: int
+    corrupt_rank: int
+    recovery_matrix: list[list[float]]  # 12x12 recovery percentages
+    prob_matrix: list[list[float]]      # 12x12 patched probabilities
+    top_clean: list[TokenProb]
+    top_corrupt: list[TokenProb]
+
+
+class MultiPatchRequest(BaseModel):
+    clean_prompt: str = "John gave Mary the book. Mary gave it to"
+    corrupt_prompt: str = "Bob gave Mary the book. Bob gave it to"
+    target_token: str = " John"
+    heads: list[HeadSpec] = []  # List of heads to patch simultaneously
+
+
+class MultiPatchResponse(BaseModel):
+    clean_prompt: str
+    corrupt_prompt: str
+    target_token: str
+    heads: list[HeadSpec]
+    clean_prob: float
+    corrupt_prob: float
+    patched_prob: float
+    clean_rank: int
+    corrupt_rank: int
+    patched_rank: int
+    recovery_pct: float
+    top_clean: list[TokenProb]
+    top_corrupt: list[TokenProb]
+    top_patched: list[TokenProb]
+
+
+class NeuronActsRequest(BaseModel):
+    text: str = "The quick brown fox jumps over the lazy dog"
+    layer: int = 0
+    neuron_index: int = 0
+
+
+class TokenActivation(BaseModel):
+    token: str
+    activation: float
+
+
+class NeuronActsResponse(BaseModel):
+    text: str
+    layer: int
+    neuron_index: int
+    tokens: list[TokenActivation]
+    min_act: float
+    max_act: float
+    d_mlp: int  # Total number of neurons in MLP layer
+
+
+class SAERequest(BaseModel):
+    text: str = "The Eiffel Tower is located in Paris, France"
+    top_k: int = 20  # Number of top features to return per token
+
+
+class FeatureActivation(BaseModel):
+    feature_index: int
+    activation: float
+    neuronpedia_url: str
+
+
+class TokenFeatures(BaseModel):
+    token: str
+    position: int
+    top_features: list[FeatureActivation]
+
+
+class SAEResponse(BaseModel):
+    text: str
+    hook_point: str
+    n_features: int
+    tokens: list[TokenFeatures]
+    top_features_overall: list[FeatureActivation]  # Top features across all tokens
 
 
 @app.get("/health")
@@ -663,7 +765,10 @@ def index():
         <div class="tabs">
             <button class="tab active" onclick="switchTab('single')">Single Head</button>
             <button class="tab" onclick="switchTab('sweep')">Full Sweep</button>
+            <button class="tab" onclick="switchTab('patchsweep')">Patch Sweep</button>
             <button class="tab" onclick="switchTab('circuit')">Circuit Analysis</button>
+            <button class="tab" onclick="switchTab('neuron')">Neuron Viz</button>
+            <button class="tab" onclick="switchTab('sae')">SAE Features</button>
         </div>
 
         <!-- Single Head Tab -->
@@ -819,6 +924,118 @@ def index():
             </div>
         </div>
 
+        <!-- Patch Sweep Tab -->
+        <div id="tab-patchsweep" class="tab-content">
+            <div class="card">
+                <div class="card-header">
+                    <div>
+                        <div class="card-title">Activation Patching Sweep</div>
+                        <div class="card-subtitle">Patch clean activations into corrupt runs to find heads that store/pass variable bindings</div>
+                    </div>
+                    <select id="patchMetricSelector" class="metric-select" onchange="updatePatchGridColors()">
+                        <option value="recovery">Recovery % (how much target prob is recovered)</option>
+                        <option value="prob">Patched Probability (raw P(target))</option>
+                    </select>
+                </div>
+
+                <div class="form-grid" style="margin-bottom: 20px;">
+                    <div class="form-group">
+                        <label>Clean Prompt</label>
+                        <input type="text" id="patch_clean_prompt" value="John gave Mary the book. Mary gave it to">
+                    </div>
+                    <div class="form-group">
+                        <label>Corrupt Prompt</label>
+                        <input type="text" id="patch_corrupt_prompt" value="Bob gave Mary the book. Bob gave it to">
+                    </div>
+                    <div class="form-group">
+                        <label>Target Token</label>
+                        <input type="text" id="patch_target_token" value=" John">
+                    </div>
+                </div>
+
+                <button class="btn btn-primary" onclick="runPatchSweep()" id="patchSweepBtn">Run Patch Sweep (144 heads)</button>
+            </div>
+
+            <div id="patchSweepResults" style="display: none;">
+                <div class="card">
+                    <div class="section-title">
+                        <h3>Baseline Metrics</h3>
+                    </div>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                        <div>
+                            <div style="font-weight: 500; margin-bottom: 8px; color: var(--text-secondary);">Clean</div>
+                            <div class="detail-row"><span style="color: var(--text-muted);">P(target)</span><span id="patch_clean_prob" style="font-family: monospace;">-</span></div>
+                            <div class="detail-row"><span style="color: var(--text-muted);">Rank</span><span id="patch_clean_rank" style="font-family: monospace;">-</span></div>
+                        </div>
+                        <div>
+                            <div style="font-weight: 500; margin-bottom: 8px; color: var(--text-secondary);">Corrupt</div>
+                            <div class="detail-row"><span style="color: var(--text-muted);">P(target)</span><span id="patch_corrupt_prob" style="font-family: monospace;">-</span></div>
+                            <div class="detail-row"><span style="color: var(--text-muted);">Rank</span><span id="patch_corrupt_rank" style="font-family: monospace;">-</span></div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="patchSelectionInfo" class="selection-info" style="display: none;">
+                    <span class="selection-count" id="patchSelectionCountText">0 heads selected</span>
+                    <span class="selection-list" id="patchSelectionList"></span>
+                    <button class="btn btn-secondary clear-btn" onclick="clearPatchSelection()">Clear All</button>
+                </div>
+
+                <div class="card">
+                    <div class="section-title">
+                        <h3>Head Recovery Heatmap</h3>
+                        <span style="color: var(--text-muted); font-size: 12px;">Click to select heads for multi-patch</span>
+                    </div>
+                    <div class="head-grid" id="patchGridContainer"></div>
+                    <div class="legend" id="patchGridLegend"></div>
+                    <div class="btn-group" style="margin-top: 16px;">
+                        <button class="btn btn-primary" onclick="runMultiPatch()" id="multiPatchBtn">Patch Selected Heads</button>
+                        <button class="btn btn-secondary" onclick="clearPatchSelection()">Clear Selection</button>
+                    </div>
+                </div>
+
+                <div id="multiPatchResults" class="card" style="display: none;">
+                    <div class="card-header">
+                        <div class="card-title">Multi-Patch Results</div>
+                    </div>
+
+                    <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-bottom: 20px;">
+                        <div>
+                            <div style="font-weight: 500; margin-bottom: 8px; color: var(--text-secondary);">Clean</div>
+                            <div class="detail-row"><span style="color: var(--text-muted);">P(target)</span><span id="mp_clean_prob" style="font-family: monospace;">-</span></div>
+                            <div class="detail-row"><span style="color: var(--text-muted);">Rank</span><span id="mp_clean_rank" style="font-family: monospace;">-</span></div>
+                        </div>
+                        <div>
+                            <div style="font-weight: 500; margin-bottom: 8px; color: var(--text-secondary);">Corrupt</div>
+                            <div class="detail-row"><span style="color: var(--text-muted);">P(target)</span><span id="mp_corrupt_prob" style="font-family: monospace;">-</span></div>
+                            <div class="detail-row"><span style="color: var(--text-muted);">Rank</span><span id="mp_corrupt_rank" style="font-family: monospace;">-</span></div>
+                        </div>
+                        <div>
+                            <div style="font-weight: 500; margin-bottom: 8px; color: var(--text-secondary);">Patched</div>
+                            <div class="detail-row"><span style="color: var(--text-muted);">P(target)</span><span id="mp_patched_prob" style="font-family: monospace;">-</span></div>
+                            <div class="detail-row"><span style="color: var(--text-muted);">Rank</span><span id="mp_patched_rank" style="font-family: monospace;">-</span></div>
+                            <div class="detail-row"><span style="color: var(--text-muted);">Recovery</span><span id="mp_recovery" style="font-family: monospace;">-</span></div>
+                        </div>
+                    </div>
+
+                    <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px;">
+                        <div>
+                            <div style="font-weight: 500; margin-bottom: 8px; color: var(--text-secondary);">Top-5 Clean</div>
+                            <div id="mp_top_clean"></div>
+                        </div>
+                        <div>
+                            <div style="font-weight: 500; margin-bottom: 8px; color: var(--text-secondary);">Top-5 Corrupt</div>
+                            <div id="mp_top_corrupt"></div>
+                        </div>
+                        <div>
+                            <div style="font-weight: 500; margin-bottom: 8px; color: var(--text-secondary);">Top-5 Patched</div>
+                            <div id="mp_top_patched"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <!-- Circuit Analysis Tab -->
         <div id="tab-circuit" class="tab-content">
             <div class="card">
@@ -914,6 +1131,113 @@ def index():
                 </div>
             </div>
         </div>
+
+        <!-- Neuron Viz Tab -->
+        <div id="tab-neuron" class="tab-content">
+            <div class="card">
+                <div class="card-header">
+                    <div>
+                        <div class="card-title">Neuron Activation Visualization</div>
+                        <div class="card-subtitle">Visualize how individual MLP neurons activate on text</div>
+                    </div>
+                </div>
+
+                <div class="form-grid" style="margin-bottom: 20px;">
+                    <div class="form-group full-width">
+                        <label>Input Text</label>
+                        <textarea id="neuron_text" rows="3" style="width: 100%; background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 8px; padding: 12px; color: var(--text-primary); font-family: inherit; resize: vertical;">The quick brown fox jumps over the lazy dog. 10 100 1000 10000</textarea>
+                    </div>
+                    <div class="form-group">
+                        <label>Layer (0-11)</label>
+                        <input type="number" id="neuron_layer" value="9" min="0" max="11">
+                    </div>
+                    <div class="form-group">
+                        <label>Neuron Index</label>
+                        <input type="number" id="neuron_index" value="652" min="0">
+                    </div>
+                </div>
+
+                <button class="btn btn-primary" onclick="runNeuronViz()" id="neuronVizBtn">Visualize Neuron</button>
+            </div>
+
+            <div id="neuronResults" style="display: none;">
+                <div class="card">
+                    <div class="section-title">
+                        <h3>Neuron Info</h3>
+                    </div>
+                    <div class="detail-row"><span style="color: var(--text-muted);">Layer</span><span id="neuron_info_layer" style="font-family: monospace;">-</span></div>
+                    <div class="detail-row"><span style="color: var(--text-muted);">Neuron Index</span><span id="neuron_info_index" style="font-family: monospace;">-</span></div>
+                    <div class="detail-row"><span style="color: var(--text-muted);">Total Neurons (d_mlp)</span><span id="neuron_info_dmlp" style="font-family: monospace;">-</span></div>
+                    <div class="detail-row"><span style="color: var(--text-muted);">Min Activation</span><span id="neuron_info_min" style="font-family: monospace;">-</span></div>
+                    <div class="detail-row"><span style="color: var(--text-muted);">Max Activation</span><span id="neuron_info_max" style="font-family: monospace;">-</span></div>
+                </div>
+
+                <div class="card">
+                    <div class="section-title">
+                        <h3>Token Activations</h3>
+                        <span style="color: var(--text-muted); font-size: 12px;">Red = high activation, White = low activation</span>
+                    </div>
+                    <div id="neuronTokensViz" style="line-height: 2.2; padding: 16px; background: var(--bg-tertiary); border-radius: 8px;"></div>
+                </div>
+
+                <div class="card">
+                    <div class="section-title">
+                        <h3>Activation Values</h3>
+                    </div>
+                    <div id="neuronActsList" style="max-height: 300px; overflow-y: auto;"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- SAE Features Tab -->
+        <div id="tab-sae" class="tab-content">
+            <div class="card">
+                <div class="card-header">
+                    <div>
+                        <div class="card-title">SAE Feature Analysis</div>
+                        <div class="card-subtitle">Decompose activations into interpretable features using Sparse Autoencoders</div>
+                    </div>
+                </div>
+
+                <div class="form-grid" style="margin-bottom: 20px;">
+                    <div class="form-group full-width">
+                        <label>Input Text</label>
+                        <textarea id="sae_text" rows="3" style="width: 100%; background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 8px; padding: 12px; color: var(--text-primary); font-family: inherit; resize: vertical;">The Eiffel Tower is located in Paris, France. It was built in 1889.</textarea>
+                    </div>
+                    <div class="form-group">
+                        <label>Top K Features per Token</label>
+                        <input type="number" id="sae_top_k" value="10" min="1" max="50">
+                    </div>
+                </div>
+
+                <button class="btn btn-primary" onclick="runSAEAnalysis()" id="saeBtn">Analyze Features</button>
+            </div>
+
+            <div id="saeResults" style="display: none;">
+                <div class="card">
+                    <div class="section-title">
+                        <h3>SAE Info</h3>
+                    </div>
+                    <div class="detail-row"><span style="color: var(--text-muted);">Hook Point</span><span id="sae_info_hook" style="font-family: monospace;">-</span></div>
+                    <div class="detail-row"><span style="color: var(--text-muted);">Total Features</span><span id="sae_info_nfeatures" style="font-family: monospace;">-</span></div>
+                </div>
+
+                <div class="card">
+                    <div class="section-title">
+                        <h3>Top Features (Overall)</h3>
+                        <span style="color: var(--text-muted); font-size: 12px;">Click to view on Neuronpedia</span>
+                    </div>
+                    <div id="saeTopFeatures" style="max-height: 400px; overflow-y: auto;"></div>
+                </div>
+
+                <div class="card">
+                    <div class="section-title">
+                        <h3>Features by Token</h3>
+                    </div>
+                    <div id="saeTokenFeatures" style="max-height: 500px; overflow-y: auto;"></div>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -923,6 +1247,8 @@ def index():
         let sweepData = null;
         let selectedSweepClampToken = null;
         let circuitSelectedHeads = new Set();
+        let patchSweepData = null;
+        let patchSelectedHeads = new Set();
 
         // ============== Tab Switching ==============
         function switchTab(tabName) {
@@ -1389,6 +1715,404 @@ def index():
             // Pre-initialize the circuit grid
             setTimeout(initCircuitGrid, 100);
         });
+
+        // ============== Patch Sweep Functions ==============
+        async function runPatchSweep() {
+            const btn = document.getElementById('patchSweepBtn');
+            btn.disabled = true;
+            btn.innerHTML = '<span class="loading"></span> Running patch sweep...';
+
+            const data = {
+                clean_prompt: document.getElementById('patch_clean_prompt').value,
+                corrupt_prompt: document.getElementById('patch_corrupt_prompt').value,
+                target_token: document.getElementById('patch_target_token').value
+            };
+
+            try {
+                const resp = await fetch('/patch-sweep', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(data)
+                });
+                patchSweepData = await resp.json();
+
+                document.getElementById('patchSweepResults').style.display = 'block';
+
+                // Display baseline metrics
+                document.getElementById('patch_clean_prob').textContent = patchSweepData.clean_prob.toFixed(4);
+                document.getElementById('patch_corrupt_prob').textContent = patchSweepData.corrupt_prob.toFixed(4);
+                document.getElementById('patch_clean_rank').textContent = patchSweepData.clean_rank;
+                document.getElementById('patch_corrupt_rank').textContent = patchSweepData.corrupt_rank;
+
+                renderPatchGrid();
+                updatePatchGridColors();
+            } catch (e) {
+                alert('Error: ' + e.message);
+            }
+
+            btn.disabled = false;
+            btn.textContent = 'Run Patch Sweep (144 heads)';
+        }
+
+        function renderPatchGrid() {
+            const container = document.getElementById('patchGridContainer');
+            container.innerHTML = '';
+
+            // Add header row
+            const emptyCorner = document.createElement('div');
+            emptyCorner.className = 'head-grid-label';
+            container.appendChild(emptyCorner);
+
+            for (let h = 0; h < 12; h++) {
+                const label = document.createElement('div');
+                label.className = 'head-grid-label';
+                label.textContent = `H${h}`;
+                container.appendChild(label);
+            }
+
+            // Add rows
+            for (let layer = 0; layer < 12; layer++) {
+                const rowLabel = document.createElement('div');
+                rowLabel.className = 'head-grid-label';
+                rowLabel.textContent = `L${layer}`;
+                container.appendChild(rowLabel);
+
+                for (let head = 0; head < 12; head++) {
+                    const cell = document.createElement('div');
+                    cell.className = 'head-grid-cell';
+                    cell.dataset.layer = layer;
+                    cell.dataset.head = head;
+
+                    const tooltip = document.createElement('div');
+                    tooltip.className = 'tooltip';
+                    const recovery = patchSweepData.recovery_matrix[layer][head];
+                    const prob = patchSweepData.prob_matrix[layer][head];
+
+                    tooltip.innerHTML = `<strong>L${layer}H${head}</strong><br>Recovery: ${recovery.toFixed(1)}%<br>P(target): ${prob.toFixed(4)}`;
+
+                    cell.appendChild(tooltip);
+                    cell.onclick = (e) => togglePatchHead(layer, head, e);
+                    container.appendChild(cell);
+                }
+            }
+        }
+
+        function togglePatchHead(layer, head, event) {
+            const key = `${layer}-${head}`;
+            const cell = event.currentTarget;
+
+            if (patchSelectedHeads.has(key)) {
+                patchSelectedHeads.delete(key);
+                cell.classList.remove('selected');
+            } else {
+                patchSelectedHeads.add(key);
+                cell.classList.add('selected');
+            }
+
+            updatePatchSelectionUI();
+        }
+
+        function updatePatchSelectionUI() {
+            const count = patchSelectedHeads.size;
+            const infoBar = document.getElementById('patchSelectionInfo');
+            const countText = document.getElementById('patchSelectionCountText');
+            const listText = document.getElementById('patchSelectionList');
+
+            if (count > 0) {
+                infoBar.style.display = 'flex';
+                countText.textContent = `${count} head${count > 1 ? 's' : ''} selected`;
+
+                const sorted = Array.from(patchSelectedHeads).sort((a, b) => {
+                    const [la, ha] = a.split('-').map(Number);
+                    const [lb, hb] = b.split('-').map(Number);
+                    return la - lb || ha - hb;
+                });
+                listText.textContent = sorted.map(k => {
+                    const [l, h] = k.split('-');
+                    return `L${l}H${h}`;
+                }).join(', ');
+            } else {
+                infoBar.style.display = 'none';
+            }
+        }
+
+        function clearPatchSelection() {
+            patchSelectedHeads.clear();
+            document.querySelectorAll('#patchGridContainer .head-grid-cell').forEach(c => c.classList.remove('selected'));
+            updatePatchSelectionUI();
+            document.getElementById('multiPatchResults').style.display = 'none';
+        }
+
+        async function runMultiPatch() {
+            if (patchSelectedHeads.size === 0) {
+                alert('Please select at least one head to patch');
+                return;
+            }
+
+            const btn = document.getElementById('multiPatchBtn');
+            btn.disabled = true;
+            btn.innerHTML = '<span class="loading"></span> Patching...';
+
+            const heads = Array.from(patchSelectedHeads).map(k => {
+                const [layer, head] = k.split('-').map(Number);
+                return { layer, head };
+            });
+
+            const data = {
+                clean_prompt: document.getElementById('patch_clean_prompt').value,
+                corrupt_prompt: document.getElementById('patch_corrupt_prompt').value,
+                target_token: document.getElementById('patch_target_token').value,
+                heads: heads
+            };
+
+            try {
+                const resp = await fetch('/multi-patch', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(data)
+                });
+                const result = await resp.json();
+
+                // Display results
+                document.getElementById('mp_clean_prob').textContent = result.clean_prob.toFixed(4);
+                document.getElementById('mp_corrupt_prob').textContent = result.corrupt_prob.toFixed(4);
+                document.getElementById('mp_patched_prob').textContent = result.patched_prob.toFixed(4);
+                document.getElementById('mp_clean_rank').textContent = result.clean_rank;
+                document.getElementById('mp_corrupt_rank').textContent = result.corrupt_rank;
+                document.getElementById('mp_patched_rank').textContent = result.patched_rank;
+                document.getElementById('mp_recovery').textContent = result.recovery_pct.toFixed(1) + '%';
+
+                const renderTokens = (tokens, elementId) => {
+                    document.getElementById(elementId).innerHTML = tokens.slice(0, 5).map((t, i) =>
+                        `<div class="detail-row" style="font-size: 12px;"><span>"${t.token}"</span><span>${t.prob.toFixed(4)}</span></div>`
+                    ).join('');
+                };
+
+                renderTokens(result.top_clean, 'mp_top_clean');
+                renderTokens(result.top_corrupt, 'mp_top_corrupt');
+                renderTokens(result.top_patched, 'mp_top_patched');
+
+                document.getElementById('multiPatchResults').style.display = 'block';
+            } catch (e) {
+                alert('Error: ' + e.message);
+            }
+
+            btn.disabled = false;
+            btn.textContent = 'Patch Selected Heads';
+        }
+
+        function updatePatchGridColors() {
+            if (!patchSweepData) return;
+
+            const metric = document.getElementById('patchMetricSelector').value;
+            const metricData = metric === 'recovery' ? patchSweepData.recovery_matrix : patchSweepData.prob_matrix;
+
+            const allValues = metricData.flat();
+            const minVal = Math.min(...allValues);
+            const maxVal = Math.max(...allValues);
+
+            document.getElementById('patchGridLegend').innerHTML = `
+                <div class="legend-item"><div class="legend-color" style="background: hsl(220, 70%, 45%);"></div> Low ${metric === 'recovery' ? 'recovery' : 'prob'}</div>
+                <div class="legend-item"><div class="legend-color" style="background: hsl(0, 70%, 55%);"></div> High ${metric === 'recovery' ? 'recovery' : 'prob'}</div>
+                <span style="margin-left: auto; color: var(--text-muted);">Range: ${minVal.toFixed(3)} to ${maxVal.toFixed(3)}</span>
+            `;
+
+            const cells = document.querySelectorAll('#patchGridContainer .head-grid-cell');
+            cells.forEach(cell => {
+                const layer = parseInt(cell.dataset.layer);
+                const head = parseInt(cell.dataset.head);
+                const value = metricData[layer][head];
+
+                const normalized = maxVal > minVal ? (value - minVal) / (maxVal - minVal) : 0.5;
+                const hue = 220 - (normalized * 220);
+                const saturation = 60 + (normalized * 20);
+                const lightness = 35 + (normalized * 25);
+
+                cell.style.backgroundColor = `hsl(${hue}, ${saturation}%, ${lightness}%)`;
+            });
+        }
+
+        // ============== Neuron Visualization ==============
+        async function runNeuronViz() {
+            const btn = document.getElementById('neuronVizBtn');
+            btn.disabled = true;
+            btn.innerHTML = '<span class="loading"></span> Analyzing...';
+
+            const data = {
+                text: document.getElementById('neuron_text').value,
+                layer: parseInt(document.getElementById('neuron_layer').value),
+                neuron_index: parseInt(document.getElementById('neuron_index').value)
+            };
+
+            try {
+                const resp = await fetch('/neuron-acts', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(data)
+                });
+                const result = await resp.json();
+
+                // Update info
+                document.getElementById('neuron_info_layer').textContent = result.layer;
+                document.getElementById('neuron_info_index').textContent = result.neuron_index;
+                document.getElementById('neuron_info_dmlp').textContent = result.d_mlp;
+                document.getElementById('neuron_info_min').textContent = result.min_act.toFixed(4);
+                document.getElementById('neuron_info_max').textContent = result.max_act.toFixed(4);
+
+                // Render colored tokens
+                renderNeuronTokens(result.tokens, result.min_act, result.max_act);
+
+                // Render activation list
+                renderNeuronActsList(result.tokens);
+
+                document.getElementById('neuronResults').style.display = 'block';
+            } catch (e) {
+                alert('Error: ' + e.message);
+            }
+
+            btn.disabled = false;
+            btn.textContent = 'Visualize Neuron';
+        }
+
+        function calculateNeuronColor(val, minVal, maxVal) {
+            // Normalize to 0-1
+            const norm = maxVal > minVal ? (val - minVal) / (maxVal - minVal) : 0;
+
+            // Interpolate from white (low) to red (high)
+            const r = 255;
+            const g = Math.round(255 * (1 - norm));
+            const b = Math.round(255 * (1 - norm));
+
+            return `rgb(${r}, ${g}, ${b})`;
+        }
+
+        function renderNeuronTokens(tokens, minAct, maxAct) {
+            const container = document.getElementById('neuronTokensViz');
+
+            const html = tokens.map(t => {
+                const color = calculateNeuronColor(t.activation, minAct, maxAct);
+                const textColor = t.activation > (minAct + maxAct) / 2 ? '#fff' : '#000';
+                const escapedToken = t.token.replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+                return `<span style="
+                    background-color: ${color};
+                    color: ${textColor};
+                    padding: 2px 4px;
+                    margin: 2px;
+                    border-radius: 4px;
+                    display: inline-block;
+                    font-family: monospace;
+                    border: 1px solid rgba(0,0,0,0.1);
+                " title="Activation: ${t.activation.toFixed(4)}">${escapedToken}</span>`;
+            }).join('');
+
+            container.innerHTML = html;
+        }
+
+        function renderNeuronActsList(tokens) {
+            const container = document.getElementById('neuronActsList');
+
+            const html = tokens.map((t, i) => {
+                const escapedToken = t.token.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                return `<div class="detail-row" style="font-size: 13px;">
+                    <span style="color: var(--text-muted);">[${i}] "${escapedToken}"</span>
+                    <span style="font-family: monospace;">${t.activation.toFixed(4)}</span>
+                </div>`;
+            }).join('');
+
+            container.innerHTML = html;
+        }
+
+        // ============== SAE Feature Analysis ==============
+        async function runSAEAnalysis() {
+            const btn = document.getElementById('saeBtn');
+            btn.disabled = true;
+            btn.innerHTML = '<span class="loading"></span> Analyzing features...';
+
+            const data = {
+                text: document.getElementById('sae_text').value,
+                top_k: parseInt(document.getElementById('sae_top_k').value)
+            };
+
+            try {
+                const resp = await fetch('/sae-features', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(data)
+                });
+                const result = await resp.json();
+
+                // Update info
+                document.getElementById('sae_info_hook').textContent = result.hook_point;
+                document.getElementById('sae_info_nfeatures').textContent = result.n_features.toLocaleString();
+
+                // Render top features overall
+                renderSAETopFeatures(result.top_features_overall);
+
+                // Render features by token
+                renderSAETokenFeatures(result.tokens);
+
+                document.getElementById('saeResults').style.display = 'block';
+            } catch (e) {
+                alert('Error: ' + e.message);
+            }
+
+            btn.disabled = false;
+            btn.textContent = 'Analyze Features';
+        }
+
+        function renderSAETopFeatures(features) {
+            const container = document.getElementById('saeTopFeatures');
+
+            const html = features.map((f, i) => `
+                <div class="detail-row" style="cursor: pointer;" onclick="window.open('${f.neuronpedia_url}', '_blank')">
+                    <span>
+                        <span style="color: var(--accent); font-weight: 500;">#${f.feature_index}</span>
+                        <span style="color: var(--text-muted); margin-left: 8px;">→ Neuronpedia</span>
+                    </span>
+                    <span style="font-family: monospace; color: var(--success);">${f.activation.toFixed(4)}</span>
+                </div>
+            `).join('');
+
+            container.innerHTML = html || '<p style="color: var(--text-muted);">No features activated</p>';
+        }
+
+        function renderSAETokenFeatures(tokens) {
+            const container = document.getElementById('saeTokenFeatures');
+
+            const html = tokens.map((t, i) => {
+                const escapedToken = t.token.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                const featuresList = t.top_features.length > 0
+                    ? t.top_features.slice(0, 5).map(f =>
+                        `<span class="feature-badge" onclick="window.open('${f.neuronpedia_url}', '_blank')" style="
+                            display: inline-block;
+                            background: var(--bg-tertiary);
+                            border: 1px solid var(--border);
+                            padding: 2px 8px;
+                            margin: 2px;
+                            border-radius: 4px;
+                            font-size: 11px;
+                            cursor: pointer;
+                        " title="Activation: ${f.activation.toFixed(4)}">
+                            #${f.feature_index} <span style="color: var(--success);">(${f.activation.toFixed(2)})</span>
+                        </span>`
+                    ).join('')
+                    : '<span style="color: var(--text-muted); font-size: 12px;">No features</span>';
+
+                return `
+                    <div style="margin-bottom: 12px; padding: 8px; background: var(--bg-secondary); border-radius: 6px;">
+                        <div style="margin-bottom: 6px;">
+                            <span style="color: var(--text-muted); font-size: 11px;">[${t.position}]</span>
+                            <span style="font-family: monospace; background: var(--bg-tertiary); padding: 2px 6px; border-radius: 4px;">${escapedToken}</span>
+                        </div>
+                        <div>${featuresList}</div>
+                    </div>
+                `;
+            }).join('');
+
+            container.innerHTML = html;
+        }
+
     </script>
 </body>
 </html>
@@ -1703,6 +2427,278 @@ def multi_ablate(request: MultiAblateRequest):
         delta_margin=delta_margin,
         top_clean=get_top_k(clean_probs),
         top_ablated=get_top_k(ablated_probs),
+    )
+
+
+@app.post("/multi-patch", response_model=MultiPatchResponse)
+def multi_patch(request: MultiPatchRequest):
+    """Patch multiple heads simultaneously with clean activations and measure combined recovery."""
+    target_id = model.to_single_token(request.target_token)
+    clean_toks = model.to_tokens(request.clean_prompt)
+    corrupt_toks = model.to_tokens(request.corrupt_prompt)
+
+    # Cache clean activations
+    _, clean_cache = model.run_with_cache(clean_toks)
+
+    # Get baseline probabilities
+    clean_logits = model(clean_toks)
+    clean_probs = clean_logits[0, -1].softmax(-1)
+    clean_prob = clean_probs[target_id].item()
+    clean_rank = (clean_probs > clean_probs[target_id]).sum().item() + 1
+
+    corrupt_logits = model(corrupt_toks)
+    corrupt_probs = corrupt_logits[0, -1].softmax(-1)
+    corrupt_prob = corrupt_probs[target_id].item()
+    corrupt_rank = (corrupt_probs > corrupt_probs[target_id]).sum().item() + 1
+
+    # Create hooks for all heads to patch
+    hooks = []
+    for head_spec in request.heads:
+        hook_name = f"blocks.{head_spec.layer}.attn.hook_z"
+        clean_head_activation = clean_cache[hook_name][:, -1, head_spec.head, :].clone()
+
+        def make_patch_hook(clean_act, h_idx):
+            def hook_fn(value, hook):
+                value = value.clone()
+                value[:, -1, h_idx, :] = clean_act
+                return value
+            return hook_fn
+
+        hooks.append((hook_name, make_patch_hook(clean_head_activation, head_spec.head)))
+
+    # Run corrupt prompt with all patches applied simultaneously
+    if hooks:
+        patched_logits = model.run_with_hooks(corrupt_toks, fwd_hooks=hooks)
+    else:
+        patched_logits = corrupt_logits
+
+    patched_probs = patched_logits[0, -1].softmax(-1)
+    patched_prob = patched_probs[target_id].item()
+    patched_rank = (patched_probs > patched_probs[target_id]).sum().item() + 1
+
+    # Calculate recovery percentage
+    if abs(clean_prob - corrupt_prob) > 1e-10:
+        recovery_pct = (patched_prob - corrupt_prob) / (clean_prob - corrupt_prob) * 100
+    else:
+        recovery_pct = 0.0
+
+    # Get top-10 tokens
+    def get_top_k(probs, k=10):
+        vals, idx = probs.topk(k)
+        tokens = [model.to_string(i.item()) for i in idx]
+        return [TokenProb(token=t, prob=p.item()) for t, p in zip(tokens, vals)]
+
+    return MultiPatchResponse(
+        clean_prompt=request.clean_prompt,
+        corrupt_prompt=request.corrupt_prompt,
+        target_token=request.target_token,
+        heads=request.heads,
+        clean_prob=clean_prob,
+        corrupt_prob=corrupt_prob,
+        patched_prob=patched_prob,
+        clean_rank=clean_rank,
+        corrupt_rank=corrupt_rank,
+        patched_rank=patched_rank,
+        recovery_pct=recovery_pct,
+        top_clean=get_top_k(clean_probs),
+        top_corrupt=get_top_k(corrupt_probs),
+        top_patched=get_top_k(patched_probs),
+    )
+
+
+@app.post("/patch-sweep", response_model=PatchSweepResponse)
+def patch_sweep(request: PatchSweepRequest):
+    """
+    Patch sweep: For each head, patch its clean activation into the corrupt run
+    and measure recovery of target token probability.
+
+    This is useful for variable binding analysis - identifying which heads
+    store/pass information about entities (names, objects) across the context.
+    """
+    target_id = model.to_single_token(request.target_token)
+    clean_toks = model.to_tokens(request.clean_prompt)
+    corrupt_toks = model.to_tokens(request.corrupt_prompt)
+
+    # Cache clean activations
+    _, clean_cache = model.run_with_cache(clean_toks)
+
+    # Get baseline probabilities
+    clean_logits = model(clean_toks)
+    clean_probs = clean_logits[0, -1].softmax(-1)
+    clean_prob = clean_probs[target_id].item()
+    clean_rank = (clean_probs > clean_probs[target_id]).sum().item() + 1
+
+    corrupt_logits = model(corrupt_toks)
+    corrupt_probs = corrupt_logits[0, -1].softmax(-1)
+    corrupt_prob = corrupt_probs[target_id].item()
+    corrupt_rank = (corrupt_probs > corrupt_probs[target_id]).sum().item() + 1
+
+    # Initialize result matrices
+    recovery_matrix = []
+    prob_matrix = []
+
+    # Sweep all 144 heads - patch one at a time
+    for layer in range(N_LAYERS):
+        layer_recovery = []
+        layer_probs = []
+
+        for head in range(N_HEADS):
+            # Create patching hook - replace corrupt activation with clean
+            hook_name = f"blocks.{layer}.attn.hook_z"
+            clean_head_activation = clean_cache[hook_name][:, -1, head, :].clone()
+
+            def make_patch_hook(clean_act):
+                def hook_fn(value, hook):
+                    value = value.clone()
+                    value[:, -1, head, :] = clean_act
+                    return value
+                return hook_fn
+
+            # Run corrupt prompt with this head patched
+            patched_logits = model.run_with_hooks(
+                corrupt_toks, fwd_hooks=[(hook_name, make_patch_hook(clean_head_activation))]
+            )
+
+            patched_probs = patched_logits[0, -1].softmax(-1)
+            patched_prob = patched_probs[target_id].item()
+
+            # Calculate recovery percentage
+            if abs(clean_prob - corrupt_prob) > 1e-10:
+                recovery = (patched_prob - corrupt_prob) / (clean_prob - corrupt_prob) * 100
+            else:
+                recovery = 0.0
+
+            layer_recovery.append(recovery)
+            layer_probs.append(patched_prob)
+
+        recovery_matrix.append(layer_recovery)
+        prob_matrix.append(layer_probs)
+
+    # Get top-k tokens helper
+    def get_top_k(probs, k=10):
+        vals, idx = probs.topk(k)
+        tokens = [model.to_string(i.item()) for i in idx]
+        return [TokenProb(token=t, prob=p.item()) for t, p in zip(tokens, vals)]
+
+    return PatchSweepResponse(
+        clean_prompt=request.clean_prompt,
+        corrupt_prompt=request.corrupt_prompt,
+        target_token=request.target_token,
+        clean_prob=clean_prob,
+        corrupt_prob=corrupt_prob,
+        clean_rank=clean_rank,
+        corrupt_rank=corrupt_rank,
+        recovery_matrix=recovery_matrix,
+        prob_matrix=prob_matrix,
+        top_clean=get_top_k(clean_probs),
+        top_corrupt=get_top_k(corrupt_probs),
+    )
+
+
+@app.post("/neuron-acts", response_model=NeuronActsResponse)
+def neuron_acts(request: NeuronActsRequest):
+    """Get neuron activations for each token in the input text."""
+    tokens = model.to_tokens(request.text)
+
+    # Run model and cache activations
+    _, cache = model.run_with_cache(tokens)
+
+    # Get MLP post-activation for the specified layer
+    # Shape: [batch, pos, d_mlp]
+    hook_name = f"blocks.{request.layer}.mlp.hook_post"
+    mlp_acts = cache[hook_name]
+
+    # Get activations for the specific neuron across all positions
+    neuron_acts = mlp_acts[0, :, request.neuron_index]  # Shape: [pos]
+
+    # Get token strings
+    token_strs = model.to_str_tokens(tokens[0])
+
+    # Build response
+    token_activations = []
+    for i, (tok_str, act) in enumerate(zip(token_strs, neuron_acts)):
+        token_activations.append(TokenActivation(
+            token=tok_str,
+            activation=act.item()
+        ))
+
+    min_act = neuron_acts.min().item()
+    max_act = neuron_acts.max().item()
+
+    return NeuronActsResponse(
+        text=request.text,
+        layer=request.layer,
+        neuron_index=request.neuron_index,
+        tokens=token_activations,
+        min_act=min_act,
+        max_act=max_act,
+        d_mlp=model.cfg.d_mlp,
+    )
+
+
+@app.post("/sae-features", response_model=SAEResponse)
+def sae_features(request: SAERequest):
+    """Get SAE feature activations for input text."""
+    tokens = model.to_tokens(request.text)
+
+    # Run model and cache activations
+    _, cache = model.run_with_cache(tokens)
+
+    # Get activations at the SAE hook point
+    activations = cache[SAE_HOOK_POINT]  # Shape: [batch, pos, d_model]
+
+    # Encode through SAE to get feature activations
+    # Shape: [batch, pos, n_features]
+    feature_acts = sae.encode(activations)
+
+    # Get token strings
+    token_strs = model.to_str_tokens(tokens[0])
+
+    # Build per-token feature info
+    token_features_list = []
+    all_feature_acts = []  # For finding top overall
+
+    for pos, tok_str in enumerate(token_strs):
+        pos_acts = feature_acts[0, pos]  # Shape: [n_features]
+
+        # Get top-k features for this position
+        top_vals, top_indices = pos_acts.topk(min(request.top_k, (pos_acts > 0).sum().item()))
+
+        top_features = []
+        for feat_idx, feat_val in zip(top_indices.tolist(), top_vals.tolist()):
+            if feat_val > 0:  # Only include active features
+                top_features.append(FeatureActivation(
+                    feature_index=feat_idx,
+                    activation=feat_val,
+                    neuronpedia_url=f"https://neuronpedia.org/gpt2-small/8-res-jb/{feat_idx}"
+                ))
+                all_feature_acts.append((feat_idx, feat_val, pos))
+
+        token_features_list.append(TokenFeatures(
+            token=tok_str,
+            position=pos,
+            top_features=top_features
+        ))
+
+    # Get top features overall (across all positions)
+    all_feature_acts.sort(key=lambda x: x[1], reverse=True)
+    seen_features = set()
+    top_overall = []
+    for feat_idx, feat_val, pos in all_feature_acts:
+        if feat_idx not in seen_features and len(top_overall) < request.top_k:
+            top_overall.append(FeatureActivation(
+                feature_index=feat_idx,
+                activation=feat_val,
+                neuronpedia_url=f"https://neuronpedia.org/gpt2-small/8-res-jb/{feat_idx}"
+            ))
+            seen_features.add(feat_idx)
+
+    return SAEResponse(
+        text=request.text,
+        hook_point=SAE_HOOK_POINT,
+        n_features=SAE_N_FEATURES,
+        tokens=token_features_list,
+        top_features_overall=top_overall,
     )
 
 
