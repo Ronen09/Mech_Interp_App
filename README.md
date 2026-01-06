@@ -1,18 +1,16 @@
 # GPT-2 Circuit Analysis
 
-Interactive web application for exploring activation patching and ablation in GPT-2 small, investigating how individual and groups of attention heads contribute to factual recall.
+Interactive web application for exploring activation patching and ablation in GPT-2 small, investigating how attention heads and SAE features contribute to predictions.
 
 ## Features
 
-- **Activation Patching**: Patch individual attention heads from a clean run into a corrupted run
-- **Single Head Ablation**: Zero out individual heads and measure impact on predictions
-- **Multi-Head Circuit Analysis**: Select and ablate multiple heads simultaneously to discover circuits
-- **Full Head Sweep**: Ablate all 144 heads and visualize importance in a heatmap
-- **Recovery Metrics**: Measure how much patching recovers the target token probability
-- **Rank Tracking**: Monitor how the target token rank changes (Clean → Corrupt → Patched)
-- **Top-10 Tokens**: View side-by-side comparison of predicted tokens across runs
-- **Interactive Web UI**: Tabbed interface with Single Head, Full Sweep, and Circuit Analysis modes
-- **REST API**: FastAPI backend for programmatic access
+- **Ablation Sweep**: Ablate all 144 heads and visualize Δprob, Δrank, Δentropy, and Δmargin heatmaps
+- **Multi-Ablation**: Select heads in the grid and ablate them together for combined impact
+- **Patch Sweep**: Patch clean activations into corrupt runs and visualize recovery or raw P(target)
+- **Multi-Patch**: Patch selected heads simultaneously and measure recovery
+- **SAE Feature Analysis**: Inspect top sparse autoencoder features per token with Neuronpedia links
+- **Interactive Web UI**: Three tabs (Ablation Sweep, Patch Sweep, SAE Features)
+- **REST API**: FastAPI endpoints for sweeps, multi-head ops, and SAE analysis
 
 ## Quick Start
 
@@ -48,60 +46,61 @@ docker compose -f docker-compose.gpu.yml up --build
 
 The UI has three tabs:
 
-#### Single Head Tab
-1. Enter your prompts (clean, corrupt) and target token
-2. Select mode: **Patch** (replace with clean) or **Ablate** (zero out)
-3. Select layer and head (0-11)
-4. Click "Run Analysis"
-
-#### Full Sweep Tab
+#### Ablation Sweep Tab
 1. Enter clean prompt and target token
 2. Click "Run Full Sweep (144 heads)"
 3. View the heatmap showing head importance
-4. Click any cell to see detailed metrics
+4. Click heads to select them for multi-ablation
 5. Use the metric dropdown to switch between Δprob, Δmargin, Δrank, Δentropy
+6. Run "Ablate Selected Heads" for combined impact
 
-#### Circuit Analysis Tab
-1. Enter clean prompt and target token
-2. Click heads in the grid to select them (green checkmark = selected)
-3. Click "Analyze Circuit" to ablate all selected heads simultaneously
-4. View combined impact metrics and token predictions
-5. Use "Clear Selection" to reset
+#### Patch Sweep Tab
+1. Enter clean prompt, corrupt prompt, and target token
+2. Click "Run Patch Sweep (144 heads)"
+3. View recovery or patched-prob heatmap
+4. Select heads to run multi-patch
+5. Compare clean/corrupt/patched metrics and top tokens
 
-### API Endpoint
+#### SAE Features Tab
+1. Enter input text and top-k features per token
+2. Click "Analyze Features"
+3. Inspect top features overall and per token (click-through to Neuronpedia)
 
-**POST** `/patch`
+### API Endpoints
+
+**GET** `/health`
+
+Returns model/device info.
+
+**POST** `/sweep`
+
+Ablate all heads and return delta metrics.
 
 Request:
 ```json
 {
   "clean_prompt": "Paris is the capital of",
-  "corrupt_prompt": "Berlin is the capital of",
   "target_token": " France",
-  "layer": 8,
-  "head": 11
+  "clamp_token": null
 }
 ```
 
-Response:
+Response (abridged):
 ```json
 {
+  "delta_probs": [[0.0, 0.01, ...]],
+  "delta_ranks": [[0.0, 2.0, ...]],
+  "delta_entropies": [[0.0, 0.03, ...]],
+  "delta_margins": [[0.0, 0.12, ...]],
   "clean_prob": 0.3342,
-  "corrupt_prob": 0.0032,
-  "patched_prob": 0.0311,
-  "recovery_pct": 8.4,
   "clean_rank": 1,
-  "corrupt_rank": 523,
-  "patched_rank": 42,
-  "top_clean": [{"token": " France", "prob": 0.3342}, ...],
-  "top_corrupt": [{"token": " Germany", "prob": 0.5213}, ...],
-  "top_patched": [{"token": " Germany", "prob": 0.5224}, ...]
+  "top_clean": [{"token": " France", "prob": 0.3342}, ...]
 }
 ```
 
 **POST** `/multi-ablate`
 
-Ablate multiple heads simultaneously for circuit analysis.
+Ablate multiple heads simultaneously.
 
 Request:
 ```json
@@ -132,10 +131,84 @@ Response:
 }
 ```
 
+**POST** `/patch-sweep`
+
+Patch clean activations into corrupt runs for all heads.
+
+Request:
+```json
+{
+  "clean_prompt": "John gave Mary the book. Mary gave it to",
+  "corrupt_prompt": "Bob gave Mary the book. Bob gave it to",
+  "target_token": " John"
+}
+```
+
+Response (abridged):
+```json
+{
+  "clean_prob": 0.2541,
+  "corrupt_prob": 0.0124,
+  "recovery_matrix": [[0.0, 3.1, ...]],
+  "prob_matrix": [[0.02, 0.03, ...]],
+  "top_clean": [{"token": " John", "prob": 0.2541}, ...],
+  "top_corrupt": [{"token": " Bob", "prob": 0.4012}, ...]
+}
+```
+
+**POST** `/multi-patch`
+
+Patch multiple heads simultaneously for combined recovery.
+
+Request:
+```json
+{
+  "clean_prompt": "John gave Mary the book. Mary gave it to",
+  "corrupt_prompt": "Bob gave Mary the book. Bob gave it to",
+  "target_token": " John",
+  "heads": [
+    {"layer": 8, "head": 11},
+    {"layer": 9, "head": 6}
+  ]
+}
+```
+
+Response (abridged):
+```json
+{
+  "patched_prob": 0.0311,
+  "recovery_pct": 8.4,
+  "patched_rank": 42,
+  "top_patched": [{"token": " John", "prob": 0.0311}, ...]
+}
+```
+
+**POST** `/sae-features`
+
+Return top SAE features per token and overall.
+
+Request:
+```json
+{
+  "text": "The Eiffel Tower is located in Paris, France",
+  "top_k": 10
+}
+```
+
+Response (abridged):
+```json
+{
+  "hook_point": "blocks.8.hook_resid_pre",
+  "n_features": 24576,
+  "tokens": [{"token": "Paris", "position": 6, "top_features": [{"feature_index": 123, "activation": 3.21, "neuronpedia_url": "..."}]}],
+  "top_features_overall": [{"feature_index": 456, "activation": 4.12, "neuronpedia_url": "..."}]
+}
+```
+
 ## Scripts
 
 ### `src/phase1_patching_demo.py`
-Sweeps all 144 attention heads (12 layers × 12 heads) and generates a heatmap showing which heads are important for factual recall.
+Sweeps all 144 attention heads by patching clean activations into a corrupt run and generates recovery/probability heatmaps.
 
 ```bash
 python src/phase1_patching_demo.py
@@ -145,6 +218,13 @@ Outputs:
 - Terminal table of recovery percentages
 - `patching_heatmap.png` visualization
 - Top-10 most important heads
+
+### `src/ablation_sweep.py`
+Ablates all 144 heads on a clean prompt and prints delta metrics (prob, rank, entropy, margin) with optional heatmaps.
+
+```bash
+python src/ablation_sweep.py
+```
 
 ### `src/patch_single_head.py`
 Patches a single head and prints recovery metrics.
@@ -174,15 +254,14 @@ If patching head `L8H11` significantly increases P(" France"), that head is impo
 
 ### Ablation
 Zero out a head's output to measure its importance:
-- **Single Head**: Ablate one head and measure Δprob, Δrank, Δentropy
+- **Single Head**: Ablate one head and measure Δprob, Δrank, Δentropy, Δmargin
 - **Full Sweep**: Ablate all 144 heads individually to create importance heatmaps
+- **Multi-Ablation**: Ablate selected heads together to measure combined impact
 
-### Circuit Analysis
-Ablate multiple heads simultaneously to discover circuits:
-- Select heads that you hypothesize form a circuit
-- Ablate them all at once and measure combined impact
-- If combined ablation has a larger effect than sum of individual ablations → heads work together
-- If combined effect is similar to individual effects → heads may be redundant
+### SAE Feature Analysis
+Decompose residual stream activations into sparse features:
+- Uses `sae-lens` for GPT-2 small layer 8 residual stream
+- Returns top features per token with links to Neuronpedia
 
 ## Project Structure
 
@@ -190,7 +269,8 @@ Ablate multiple heads simultaneously to discover circuits:
 .
 ├── app.py                      # FastAPI web server
 ├── src/
-│   ├── phase1_patching_demo.py # Full head sweep
+│   ├── ablation_sweep.py       # Full ablation sweep
+│   ├── phase1_patching_demo.py # Full patching sweep
 │   ├── patch_single_head.py    # Single head patching
 │   └── load_gpt2.py            # Model loader
 ├── Dockerfile
@@ -211,16 +291,18 @@ This shows L8H11 partially carries the "Paris → France" association, moving th
 
 ## Requirements
 
-- Python 3.11+
-- PyTorch 2.6+
+- Python 3.11+ (Docker uses 3.11-slim)
+- PyTorch
 - transformer-lens
-- FastAPI
-- matplotlib (for heatmap generation)
+- sae-lens
+- FastAPI + uvicorn
+- matplotlib (for optional heatmap generation)
 
 ## Tech Stack
 
 - **Model**: GPT-2 small (124M parameters)
 - **Framework**: TransformerLens for interpretability hooks
+- **SAE**: SAE-Lens for sparse autoencoder features
 - **Backend**: FastAPI
 - **Frontend**: Vanilla HTML/CSS/JS
 - **Deployment**: Docker with optional GPU support
