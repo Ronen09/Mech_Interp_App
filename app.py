@@ -31,40 +31,9 @@ SAE_N_FEATURES = sae.cfg.d_sae
 print(f"SAE loaded: {SAE_N_FEATURES} features at {SAE_HOOK_POINT}")
 
 
-class PatchRequest(BaseModel):
-    clean_prompt: str = "Paris is the capital of"
-    corrupt_prompt: str = "Berlin is the capital of"
-    target_token: str = " France"
-    layer: int = 8
-    head: int = 11
-    mode: str = "patch"  # "patch" or "ablate"
-    clamp_token: str | None = None  # For ablation: token to clamp to baseline
-
-
 class TokenProb(BaseModel):
     token: str
     prob: float
-
-
-class PatchResponse(BaseModel):
-    clean_prompt: str
-    corrupt_prompt: str
-    target_token: str
-    layer: int
-    head: int
-    clean_prob: float
-    corrupt_prob: float
-    patched_prob: float
-    recovery_pct: float
-    clean_rank: int
-    corrupt_rank: int
-    patched_rank: int
-    top_clean: list[TokenProb]
-    top_corrupt: list[TokenProb]
-    top_patched: list[TokenProb]
-    delta_prob: float = 0.0
-    delta_rank: int = 0
-    delta_entropy: float = 0.0
 
 
 class SweepRequest(BaseModel):
@@ -152,27 +121,6 @@ class MultiPatchResponse(BaseModel):
     top_clean: list[TokenProb]
     top_corrupt: list[TokenProb]
     top_patched: list[TokenProb]
-
-
-class NeuronActsRequest(BaseModel):
-    text: str = "The quick brown fox jumps over the lazy dog"
-    layer: int = 0
-    neuron_index: int = 0
-
-
-class TokenActivation(BaseModel):
-    token: str
-    activation: float
-
-
-class NeuronActsResponse(BaseModel):
-    text: str
-    layer: int
-    neuron_index: int
-    tokens: list[TokenActivation]
-    min_act: float
-    max_act: float
-    d_mlp: int  # Total number of neurons in MLP layer
 
 
 class SAERequest(BaseModel):
@@ -763,110 +711,13 @@ def index():
         </header>
 
         <div class="tabs">
-            <button class="tab active" onclick="switchTab('single')">Single Head</button>
-            <button class="tab" onclick="switchTab('sweep')">Full Sweep</button>
+            <button class="tab active" onclick="switchTab('sweep')">Ablation Sweep</button>
             <button class="tab" onclick="switchTab('patchsweep')">Patch Sweep</button>
-            <button class="tab" onclick="switchTab('circuit')">Circuit Analysis</button>
-            <button class="tab" onclick="switchTab('neuron')">Neuron Viz</button>
             <button class="tab" onclick="switchTab('sae')">SAE Features</button>
         </div>
 
-        <!-- Single Head Tab -->
-        <div id="tab-single" class="tab-content active">
-            <div class="card">
-                <div class="card-header">
-                    <div>
-                        <div class="card-title">Single Head Patching / Ablation</div>
-                        <div class="card-subtitle">Test the effect of patching or ablating individual attention heads</div>
-                    </div>
-                </div>
-
-                <div class="form-grid">
-                    <div class="form-group">
-                        <label>Clean Prompt</label>
-                        <input type="text" id="clean_prompt" value="Paris is the capital of">
-                    </div>
-                    <div class="form-group">
-                        <label>Corrupt Prompt</label>
-                        <input type="text" id="corrupt_prompt" value="Berlin is the capital of">
-                    </div>
-                    <div class="form-group">
-                        <label>Target Token</label>
-                        <input type="text" id="target_token" value=" France" placeholder="Include leading space if needed">
-                    </div>
-                    <div class="form-group">
-                        <label>Mode</label>
-                        <select id="mode" onchange="handleModeChange()">
-                            <option value="patch">Patch (replace with clean)</option>
-                            <option value="ablate">Ablate (zero out)</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label>Layer (0-11)</label>
-                        <input type="number" id="layer" value="8" min="0" max="11">
-                    </div>
-                    <div class="form-group">
-                        <label>Head (0-11)</label>
-                        <input type="number" id="head" value="11" min="0" max="11">
-                    </div>
-                </div>
-
-                <div class="btn-group">
-                    <button class="btn btn-primary" onclick="runPatch()" id="patchBtn">Run Analysis</button>
-                </div>
-            </div>
-
-            <div id="results" class="card" style="display: none;">
-                <div class="card-header">
-                    <div class="card-title">Results</div>
-                </div>
-
-                <div class="results-grid">
-                    <div class="result-card">
-                        <div class="result-label">Clean P(target)</div>
-                        <div class="result-value" id="clean_prob">-</div>
-                    </div>
-                    <div class="result-card" id="corrupt_card">
-                        <div class="result-label">Corrupt P(target)</div>
-                        <div class="result-value" id="corrupt_prob">-</div>
-                    </div>
-                    <div class="result-card">
-                        <div class="result-label" id="modified_label">Patched P(target)</div>
-                        <div class="result-value" id="patched_prob">-</div>
-                    </div>
-                    <div class="result-card" id="recovery_card">
-                        <div class="result-label">Recovery</div>
-                        <div class="result-value positive" id="recovery_pct">-</div>
-                        <div class="progress-bar">
-                            <div class="progress-fill" id="recovery_bar" style="width: 0%"></div>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="result-card" style="margin-bottom: 24px;">
-                    <div class="result-label" id="rank_label">Rank Progression</div>
-                    <div class="result-value" id="ranks" style="font-size: 1.1rem;">-</div>
-                </div>
-
-                <div class="tokens-container">
-                    <div class="token-list" id="clean_token_list">
-                        <div class="token-list-header" id="clean_tokens_label">Top-10 Tokens (Clean)</div>
-                        <div id="top_clean"></div>
-                    </div>
-                    <div class="token-list" id="corrupt_token_list">
-                        <div class="token-list-header">Top-10 Tokens (Corrupt)</div>
-                        <div id="top_corrupt"></div>
-                    </div>
-                    <div class="token-list">
-                        <div class="token-list-header" id="modified_tokens_label">Top-10 Tokens (Patched)</div>
-                        <div id="top_patched"></div>
-                    </div>
-                </div>
-            </div>
-        </div>
-
         <!-- Sweep Tab -->
-        <div id="tab-sweep" class="tab-content">
+        <div id="tab-sweep" class="tab-content active">
             <div class="card">
                 <div class="card-header">
                     <div>
@@ -899,26 +750,58 @@ def index():
                 <div class="card">
                     <div class="section-title">
                         <h3>Top-10 Tokens (Clean)</h3>
-                        <span class="badge" id="sweepClampBadge" style="display: none;">Clamped</span>
                     </div>
-                    <p style="color: var(--text-secondary); font-size: 13px; margin-bottom: 12px;">Click a token to clamp it during ablation</p>
                     <div class="sweep-tokens" id="sweepTopClean"></div>
                 </div>
 
-                <div class="split-layout">
-                    <div class="card">
-                        <div class="section-title">
-                            <h3>Attention Head Importance</h3>
-                        </div>
-                        <div class="head-grid" id="gridContainer"></div>
-                        <div class="legend" id="gridLegend"></div>
+                <div id="sweepSelectionInfo" class="selection-info" style="display: none;">
+                    <span class="selection-count" id="sweepSelectionCountText">0 heads selected</span>
+                    <span class="selection-list" id="sweepSelectionList"></span>
+                    <button class="btn btn-secondary clear-btn" onclick="clearSweepSelection()">Clear All</button>
+                </div>
+
+                <div class="card">
+                    <div class="section-title">
+                        <h3>Attention Head Importance</h3>
+                        <span style="color: var(--text-muted); font-size: 12px;">Click to select heads for multi-ablation</span>
+                    </div>
+                    <div class="head-grid" id="gridContainer"></div>
+                    <div class="legend" id="gridLegend"></div>
+                    <div class="btn-group" style="margin-top: 16px;">
+                        <button class="btn btn-primary" onclick="runMultiAblate()" id="multiAblateBtn">Ablate Selected Heads</button>
+                        <button class="btn btn-secondary" onclick="clearSweepSelection()">Clear Selection</button>
+                    </div>
+                </div>
+
+                <div id="multiAblateResults" class="card" style="display: none;">
+                    <div class="card-header">
+                        <div class="card-title">Multi-Ablation Results</div>
                     </div>
 
-                    <div class="detail-panel" id="detailPanel" style="display: none;">
-                        <div class="section-title">
-                            <h3>Head Details</h3>
+                    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; margin-bottom: 20px;">
+                        <div>
+                            <div style="font-weight: 500; margin-bottom: 8px; color: var(--text-secondary);">Clean</div>
+                            <div class="detail-row"><span style="color: var(--text-muted);">P(target)</span><span id="ma_clean_prob" style="font-family: monospace;">-</span></div>
+                            <div class="detail-row"><span style="color: var(--text-muted);">Rank</span><span id="ma_clean_rank" style="font-family: monospace;">-</span></div>
                         </div>
-                        <div id="detailContent"></div>
+                        <div>
+                            <div style="font-weight: 500; margin-bottom: 8px; color: var(--text-secondary);">Ablated</div>
+                            <div class="detail-row"><span style="color: var(--text-muted);">P(target)</span><span id="ma_ablated_prob" style="font-family: monospace;">-</span></div>
+                            <div class="detail-row"><span style="color: var(--text-muted);">Rank</span><span id="ma_ablated_rank" style="font-family: monospace;">-</span></div>
+                            <div class="detail-row"><span style="color: var(--text-muted);">Δprob</span><span id="ma_delta_prob" style="font-family: monospace;">-</span></div>
+                            <div class="detail-row"><span style="color: var(--text-muted);">Δmargin</span><span id="ma_delta_margin" style="font-family: monospace;">-</span></div>
+                        </div>
+                    </div>
+
+                    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px;">
+                        <div>
+                            <div style="font-weight: 500; margin-bottom: 8px; color: var(--text-secondary);">Top-5 Clean</div>
+                            <div id="ma_top_clean"></div>
+                        </div>
+                        <div>
+                            <div style="font-weight: 500; margin-bottom: 8px; color: var(--text-secondary);">Top-5 Ablated</div>
+                            <div id="ma_top_ablated"></div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -1036,159 +919,6 @@ def index():
             </div>
         </div>
 
-        <!-- Circuit Analysis Tab -->
-        <div id="tab-circuit" class="tab-content">
-            <div class="card">
-                <div class="card-header">
-                    <div>
-                        <div class="card-title">Multi-Head Circuit Analysis</div>
-                        <div class="card-subtitle">Select multiple heads to ablate simultaneously and discover circuits</div>
-                    </div>
-                </div>
-
-                <div class="form-grid" style="margin-bottom: 20px;">
-                    <div class="form-group">
-                        <label>Clean Prompt</label>
-                        <input type="text" id="circuit_clean_prompt" value="Paris is the capital of">
-                    </div>
-                    <div class="form-group">
-                        <label>Target Token</label>
-                        <input type="text" id="circuit_target_token" value=" France">
-                    </div>
-                </div>
-
-                <div class="section-title">
-                    <h3>Select Heads to Ablate</h3>
-                    <span class="badge" id="selectedCount">0 selected</span>
-                </div>
-
-                <div id="circuitSelectionInfo" class="selection-info" style="display: none;">
-                    <span class="selection-count" id="selectionCountText">0 heads selected</span>
-                    <span class="selection-list" id="selectionList"></span>
-                    <button class="btn btn-secondary clear-btn" onclick="clearCircuitSelection()">Clear All</button>
-                </div>
-
-                <div class="head-grid" id="circuitGrid"></div>
-
-                <div class="btn-group">
-                    <button class="btn btn-primary" onclick="runCircuitAnalysis()" id="circuitBtn">Analyze Circuit</button>
-                    <button class="btn btn-secondary" onclick="clearCircuitSelection()">Clear Selection</button>
-                </div>
-            </div>
-
-            <div id="circuitResults" class="card" style="display: none;">
-                <div class="card-header">
-                    <div class="card-title">Circuit Analysis Results</div>
-                </div>
-
-                <div class="results-grid">
-                    <div class="result-card">
-                        <div class="result-label">Clean P(target)</div>
-                        <div class="result-value" id="circuit_clean_prob">-</div>
-                    </div>
-                    <div class="result-card">
-                        <div class="result-label">Ablated P(target)</div>
-                        <div class="result-value" id="circuit_ablated_prob">-</div>
-                    </div>
-                    <div class="result-card">
-                        <div class="result-label">Δ Probability</div>
-                        <div class="result-value negative" id="circuit_delta_prob">-</div>
-                    </div>
-                    <div class="result-card">
-                        <div class="result-label">Δ Rank</div>
-                        <div class="result-value" id="circuit_delta_rank">-</div>
-                    </div>
-                </div>
-
-                <div class="results-grid" style="margin-bottom: 24px;">
-                    <div class="result-card">
-                        <div class="result-label">Clean Rank</div>
-                        <div class="result-value" id="circuit_clean_rank">-</div>
-                    </div>
-                    <div class="result-card">
-                        <div class="result-label">Ablated Rank</div>
-                        <div class="result-value" id="circuit_ablated_rank">-</div>
-                    </div>
-                    <div class="result-card">
-                        <div class="result-label">Δ Entropy</div>
-                        <div class="result-value" id="circuit_delta_entropy">-</div>
-                    </div>
-                    <div class="result-card">
-                        <div class="result-label">Δ Margin</div>
-                        <div class="result-value" id="circuit_delta_margin">-</div>
-                    </div>
-                </div>
-
-                <div class="tokens-container">
-                    <div class="token-list">
-                        <div class="token-list-header">Top-10 Tokens (Clean)</div>
-                        <div id="circuit_top_clean"></div>
-                    </div>
-                    <div class="token-list">
-                        <div class="token-list-header">Top-10 Tokens (After Ablation)</div>
-                        <div id="circuit_top_ablated"></div>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Neuron Viz Tab -->
-        <div id="tab-neuron" class="tab-content">
-            <div class="card">
-                <div class="card-header">
-                    <div>
-                        <div class="card-title">Neuron Activation Visualization</div>
-                        <div class="card-subtitle">Visualize how individual MLP neurons activate on text</div>
-                    </div>
-                </div>
-
-                <div class="form-grid" style="margin-bottom: 20px;">
-                    <div class="form-group full-width">
-                        <label>Input Text</label>
-                        <textarea id="neuron_text" rows="3" style="width: 100%; background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 8px; padding: 12px; color: var(--text-primary); font-family: inherit; resize: vertical;">The quick brown fox jumps over the lazy dog. 10 100 1000 10000</textarea>
-                    </div>
-                    <div class="form-group">
-                        <label>Layer (0-11)</label>
-                        <input type="number" id="neuron_layer" value="9" min="0" max="11">
-                    </div>
-                    <div class="form-group">
-                        <label>Neuron Index</label>
-                        <input type="number" id="neuron_index" value="652" min="0">
-                    </div>
-                </div>
-
-                <button class="btn btn-primary" onclick="runNeuronViz()" id="neuronVizBtn">Visualize Neuron</button>
-            </div>
-
-            <div id="neuronResults" style="display: none;">
-                <div class="card">
-                    <div class="section-title">
-                        <h3>Neuron Info</h3>
-                    </div>
-                    <div class="detail-row"><span style="color: var(--text-muted);">Layer</span><span id="neuron_info_layer" style="font-family: monospace;">-</span></div>
-                    <div class="detail-row"><span style="color: var(--text-muted);">Neuron Index</span><span id="neuron_info_index" style="font-family: monospace;">-</span></div>
-                    <div class="detail-row"><span style="color: var(--text-muted);">Total Neurons (d_mlp)</span><span id="neuron_info_dmlp" style="font-family: monospace;">-</span></div>
-                    <div class="detail-row"><span style="color: var(--text-muted);">Min Activation</span><span id="neuron_info_min" style="font-family: monospace;">-</span></div>
-                    <div class="detail-row"><span style="color: var(--text-muted);">Max Activation</span><span id="neuron_info_max" style="font-family: monospace;">-</span></div>
-                </div>
-
-                <div class="card">
-                    <div class="section-title">
-                        <h3>Token Activations</h3>
-                        <span style="color: var(--text-muted); font-size: 12px;">Red = high activation, White = low activation</span>
-                    </div>
-                    <div id="neuronTokensViz" style="line-height: 2.2; padding: 16px; background: var(--bg-tertiary); border-radius: 8px;"></div>
-                </div>
-
-                <div class="card">
-                    <div class="section-title">
-                        <h3>Activation Values</h3>
-                    </div>
-                    <div id="neuronActsList" style="max-height: 300px; overflow-y: auto;"></div>
-                </div>
-            </div>
-        </div>
-
         <!-- SAE Features Tab -->
         <div id="tab-sae" class="tab-content">
             <div class="card">
@@ -1242,8 +972,6 @@ def index():
 
     <script>
         // ============== Global State ==============
-        let selectedClampToken = null;
-        let lastRequestData = null;
         let sweepData = null;
         let selectedSweepClampToken = null;
         let circuitSelectedHeads = new Set();
@@ -1262,111 +990,6 @@ def index():
             if (tabName === 'circuit') {
                 initCircuitGrid();
             }
-        }
-
-        // ============== Single Head Mode ==============
-        function handleModeChange() {
-            selectedClampToken = null;
-            document.querySelectorAll('#top_clean .token-item').forEach(el => {
-                el.classList.remove('selected');
-            });
-        }
-
-        async function selectTokenForClamping(token) {
-            if (selectedClampToken === token) {
-                selectedClampToken = null;
-            } else {
-                selectedClampToken = token;
-            }
-            if (lastRequestData && lastRequestData.mode === 'ablate') {
-                await runPatch();
-            }
-        }
-
-        async function runPatch() {
-            const btn = document.getElementById('patchBtn');
-            btn.disabled = true;
-            btn.innerHTML = '<span class="loading"></span> Running...';
-
-            const mode = document.getElementById('mode').value;
-            const data = {
-                clean_prompt: document.getElementById('clean_prompt').value,
-                corrupt_prompt: document.getElementById('corrupt_prompt').value,
-                target_token: document.getElementById('target_token').value,
-                layer: parseInt(document.getElementById('layer').value),
-                head: parseInt(document.getElementById('head').value),
-                mode: mode,
-                clamp_token: mode === 'ablate' ? selectedClampToken : null
-            };
-
-            lastRequestData = data;
-
-            try {
-                const resp = await fetch('/patch', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(data)
-                });
-                const result = await resp.json();
-
-                document.getElementById('results').style.display = 'block';
-
-                if (mode === 'patch') {
-                    document.getElementById('modified_label').textContent = 'Patched P(target)';
-                    document.getElementById('rank_label').textContent = 'Rank Progression';
-                    document.getElementById('modified_tokens_label').textContent = 'Top-10 Tokens (Patched)';
-                    document.getElementById('clean_tokens_label').textContent = 'Top-10 Tokens (Clean)';
-
-                    document.getElementById('corrupt_card').style.display = 'block';
-                    document.getElementById('recovery_card').style.display = 'block';
-
-                    document.getElementById('clean_prob').textContent = result.clean_prob.toFixed(4);
-                    document.getElementById('corrupt_prob').textContent = result.corrupt_prob.toFixed(4);
-                    document.getElementById('patched_prob').textContent = result.patched_prob.toFixed(4);
-                    document.getElementById('ranks').textContent = `#${result.clean_rank} → #${result.corrupt_rank} → #${result.patched_rank}`;
-                    document.getElementById('recovery_pct').textContent = result.recovery_pct.toFixed(1) + '%';
-                    document.getElementById('recovery_bar').style.width = Math.min(100, Math.max(0, result.recovery_pct)) + '%';
-
-                    document.getElementById('corrupt_token_list').style.display = 'block';
-                } else {
-                    const clampSuffix = data.clamp_token ? ` (clamped: "${data.clamp_token}")` : '';
-                    document.getElementById('modified_label').textContent = 'Ablated P(target)' + clampSuffix;
-                    document.getElementById('rank_label').textContent = 'Degradation Metrics';
-                    document.getElementById('modified_tokens_label').textContent = 'Top-10 Tokens (Ablated)';
-                    document.getElementById('clean_tokens_label').textContent = 'Top-10 Tokens (Clean) - Click to clamp';
-
-                    document.getElementById('corrupt_card').style.display = 'none';
-                    document.getElementById('recovery_card').style.display = 'none';
-
-                    document.getElementById('clean_prob').textContent = result.clean_prob.toFixed(4);
-                    document.getElementById('patched_prob').textContent = result.patched_prob.toFixed(4);
-                    document.getElementById('ranks').textContent = `Δprob: ${result.delta_prob.toFixed(4)} | Δrank: ${result.delta_rank > 0 ? '+' : ''}${result.delta_rank} | Δentropy: ${result.delta_entropy.toFixed(3)}`;
-
-                    document.getElementById('corrupt_token_list').style.display = 'none';
-                }
-
-                renderTokens(result.top_clean, 'top_clean', mode === 'ablate');
-                renderTokens(result.top_corrupt, 'top_corrupt');
-                renderTokens(result.top_patched, 'top_patched');
-            } catch (e) {
-                alert('Error: ' + e.message);
-            }
-
-            btn.disabled = false;
-            btn.textContent = 'Run Analysis';
-        }
-
-        function renderTokens(tokens, elementId, clickable = false) {
-            const html = tokens.map((t, i) => {
-                const clickClass = clickable ? 'clickable' : '';
-                const selectedClass = (clickable && selectedClampToken === t.token) ? 'selected' : '';
-                const clickAttr = clickable ? `onclick="selectTokenForClamping('${t.token.replace(/'/g, "\\'")}')"` : '';
-                return `<div class="token-item ${clickClass} ${selectedClass}" ${clickAttr}>
-                    <span class="token-name">${i+1}. "${t.token}"</span>
-                    <span class="token-prob">${t.prob.toFixed(4)}</span>
-                </div>`;
-            }).join('');
-            document.getElementById(elementId).innerHTML = html;
         }
 
         // ============== Sweep Mode ==============
@@ -1932,97 +1555,6 @@ def index():
             });
         }
 
-        // ============== Neuron Visualization ==============
-        async function runNeuronViz() {
-            const btn = document.getElementById('neuronVizBtn');
-            btn.disabled = true;
-            btn.innerHTML = '<span class="loading"></span> Analyzing...';
-
-            const data = {
-                text: document.getElementById('neuron_text').value,
-                layer: parseInt(document.getElementById('neuron_layer').value),
-                neuron_index: parseInt(document.getElementById('neuron_index').value)
-            };
-
-            try {
-                const resp = await fetch('/neuron-acts', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(data)
-                });
-                const result = await resp.json();
-
-                // Update info
-                document.getElementById('neuron_info_layer').textContent = result.layer;
-                document.getElementById('neuron_info_index').textContent = result.neuron_index;
-                document.getElementById('neuron_info_dmlp').textContent = result.d_mlp;
-                document.getElementById('neuron_info_min').textContent = result.min_act.toFixed(4);
-                document.getElementById('neuron_info_max').textContent = result.max_act.toFixed(4);
-
-                // Render colored tokens
-                renderNeuronTokens(result.tokens, result.min_act, result.max_act);
-
-                // Render activation list
-                renderNeuronActsList(result.tokens);
-
-                document.getElementById('neuronResults').style.display = 'block';
-            } catch (e) {
-                alert('Error: ' + e.message);
-            }
-
-            btn.disabled = false;
-            btn.textContent = 'Visualize Neuron';
-        }
-
-        function calculateNeuronColor(val, minVal, maxVal) {
-            // Normalize to 0-1
-            const norm = maxVal > minVal ? (val - minVal) / (maxVal - minVal) : 0;
-
-            // Interpolate from white (low) to red (high)
-            const r = 255;
-            const g = Math.round(255 * (1 - norm));
-            const b = Math.round(255 * (1 - norm));
-
-            return `rgb(${r}, ${g}, ${b})`;
-        }
-
-        function renderNeuronTokens(tokens, minAct, maxAct) {
-            const container = document.getElementById('neuronTokensViz');
-
-            const html = tokens.map(t => {
-                const color = calculateNeuronColor(t.activation, minAct, maxAct);
-                const textColor = t.activation > (minAct + maxAct) / 2 ? '#fff' : '#000';
-                const escapedToken = t.token.replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-
-                return `<span style="
-                    background-color: ${color};
-                    color: ${textColor};
-                    padding: 2px 4px;
-                    margin: 2px;
-                    border-radius: 4px;
-                    display: inline-block;
-                    font-family: monospace;
-                    border: 1px solid rgba(0,0,0,0.1);
-                " title="Activation: ${t.activation.toFixed(4)}">${escapedToken}</span>`;
-            }).join('');
-
-            container.innerHTML = html;
-        }
-
-        function renderNeuronActsList(tokens) {
-            const container = document.getElementById('neuronActsList');
-
-            const html = tokens.map((t, i) => {
-                const escapedToken = t.token.replace(/</g, '&lt;').replace(/>/g, '&gt;');
-                return `<div class="detail-row" style="font-size: 13px;">
-                    <span style="color: var(--text-muted);">[${i}] "${escapedToken}"</span>
-                    <span style="font-family: monospace;">${t.activation.toFixed(4)}</span>
-                </div>`;
-            }).join('');
-
-            container.innerHTML = html;
-        }
-
         // ============== SAE Feature Analysis ==============
         async function runSAEAnalysis() {
             const btn = document.getElementById('saeBtn');
@@ -2117,125 +1649,6 @@ def index():
 </body>
 </html>
 """
-
-
-@app.post("/patch", response_model=PatchResponse)
-def patch(request: PatchRequest):
-    target_id = model.to_single_token(request.target_token)
-
-    # Tokenize
-    clean_toks = model.to_tokens(request.clean_prompt)
-    corrupt_toks = model.to_tokens(request.corrupt_prompt)
-
-    # Cache clean activations
-    _, clean_cache = model.run_with_cache(clean_toks)
-
-    # Get baseline probabilities
-    clean_logits = model(clean_toks)
-    clean_probs = clean_logits[0, -1].softmax(-1)
-    clean_prob = clean_probs[target_id].item()
-
-    corrupt_logits = model(corrupt_toks)
-    corrupt_probs = corrupt_logits[0, -1].softmax(-1)
-    corrupt_prob = corrupt_probs[target_id].item()
-
-    # Patch or ablate the head
-    hook_name = f"blocks.{request.layer}.attn.hook_z"
-
-    if request.mode == "patch":
-        clean_head = clean_cache[hook_name][:, -1, request.head, :].clone()
-        def hook_fn(value, hook):
-            value = value.clone()
-            value[:, -1, request.head, :] = clean_head
-            return value
-
-        patched_logits = model.run_with_hooks(
-            corrupt_toks, fwd_hooks=[(hook_name, hook_fn)]
-        )
-        patched_probs = patched_logits[0, -1].softmax(-1)
-        patched_prob = patched_probs[target_id].item()
-
-        # Calculate recovery
-        if clean_prob - corrupt_prob > 1e-10:
-            recovery_pct = (patched_prob - corrupt_prob) / (clean_prob - corrupt_prob) * 100
-        else:
-            recovery_pct = 0.0
-    else:  # ablate
-        def hook_fn(value, hook):
-            value = value.clone()
-            value[:, -1, request.head, :] = 0.0
-            return value
-
-        # Run ablation on clean prompt
-        ablated_logits = model.run_with_hooks(
-            clean_toks, fwd_hooks=[(hook_name, hook_fn)]
-        )
-
-        # Optional: Clamp selected token logit to baseline
-        if request.clamp_token:
-            try:
-                clamp_id = model.to_single_token(request.clamp_token)
-                baseline_clamp_logit = clean_logits[0, -1, clamp_id].item()
-                ablated_logits[0, -1, clamp_id] = baseline_clamp_logit
-            except:
-                pass  # If token is invalid, just skip clamping
-
-        patched_probs = ablated_logits[0, -1].softmax(-1)
-        patched_prob = patched_probs[target_id].item()
-
-        # Store delta metrics (we'll send these in the response for ablation mode)
-        recovery_pct = 0.0  # Not used for ablation
-
-    # Calculate ranks (1-indexed)
-    clean_rank = (clean_probs > clean_probs[target_id]).sum().item() + 1
-    corrupt_rank = (corrupt_probs > corrupt_probs[target_id]).sum().item() + 1
-    patched_rank = (patched_probs > patched_probs[target_id]).sum().item() + 1
-
-    # Calculate deltas for ablation mode
-    if request.mode == "ablate":
-        # Δprob = p_clean - p_ablated
-        delta_prob = clean_prob - patched_prob
-        # Δrank = rank_ablated - rank_clean (positive means worse)
-        delta_rank = patched_rank - clean_rank
-        # Δentropy = H(p_ablated) - H(p_clean)
-        clean_entropy = -(clean_probs * torch.log(clean_probs + 1e-12)).sum().item()
-        ablated_entropy = -(patched_probs * torch.log(patched_probs + 1e-12)).sum().item()
-        delta_entropy = ablated_entropy - clean_entropy
-    else:
-        delta_prob = 0.0
-        delta_rank = 0
-        delta_entropy = 0.0
-
-    # Get top-10 tokens
-    def get_top_k(probs, k=10):
-        vals, idx = probs.topk(k)
-        tokens = [model.to_string(i.item()) for i in idx]
-        return [TokenProb(token=t, prob=p.item()) for t, p in zip(tokens, vals)]
-
-    top_clean = get_top_k(clean_probs)
-    top_corrupt = get_top_k(corrupt_probs)
-    top_patched = get_top_k(patched_probs)
-
-    return PatchResponse(
-        clean_prompt=request.clean_prompt,
-        corrupt_prompt=request.corrupt_prompt,
-        target_token=request.target_token,
-        layer=request.layer,
-        head=request.head,
-        clean_prob=clean_prob,
-        corrupt_prob=corrupt_prob,
-        patched_prob=patched_prob,
-        recovery_pct=recovery_pct,
-        clean_rank=clean_rank,
-        corrupt_rank=corrupt_rank,
-        patched_rank=patched_rank,
-        top_clean=top_clean,
-        top_corrupt=top_corrupt,
-        top_patched=top_patched,
-        delta_prob=delta_prob,
-        delta_rank=delta_rank,
-        delta_entropy=delta_entropy,
-    )
 
 
 @app.post("/sweep", response_model=SweepResponse)
@@ -2592,47 +2005,6 @@ def patch_sweep(request: PatchSweepRequest):
         prob_matrix=prob_matrix,
         top_clean=get_top_k(clean_probs),
         top_corrupt=get_top_k(corrupt_probs),
-    )
-
-
-@app.post("/neuron-acts", response_model=NeuronActsResponse)
-def neuron_acts(request: NeuronActsRequest):
-    """Get neuron activations for each token in the input text."""
-    tokens = model.to_tokens(request.text)
-
-    # Run model and cache activations
-    _, cache = model.run_with_cache(tokens)
-
-    # Get MLP post-activation for the specified layer
-    # Shape: [batch, pos, d_mlp]
-    hook_name = f"blocks.{request.layer}.mlp.hook_post"
-    mlp_acts = cache[hook_name]
-
-    # Get activations for the specific neuron across all positions
-    neuron_acts = mlp_acts[0, :, request.neuron_index]  # Shape: [pos]
-
-    # Get token strings
-    token_strs = model.to_str_tokens(tokens[0])
-
-    # Build response
-    token_activations = []
-    for i, (tok_str, act) in enumerate(zip(token_strs, neuron_acts)):
-        token_activations.append(TokenActivation(
-            token=tok_str,
-            activation=act.item()
-        ))
-
-    min_act = neuron_acts.min().item()
-    max_act = neuron_acts.max().item()
-
-    return NeuronActsResponse(
-        text=request.text,
-        layer=request.layer,
-        neuron_index=request.neuron_index,
-        tokens=token_activations,
-        min_act=min_act,
-        max_act=max_act,
-        d_mlp=model.cfg.d_mlp,
     )
 
 
